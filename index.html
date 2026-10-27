@@ -1968,15 +1968,35 @@ const HINT_FOR={start:{go:["sig","look"]},obstacle:{go:["sig","look"]},lanechang
 const WARN_FOR={left:{sig:["sig"],pos:["pos"],spd:["speed"]},right:{sig:["sig"],pos:["pos"],spd:["speed"]},stop:{stop:["stoppos"]},rail:{stop:["stoppos"]},signal:{stop:["stoppos"]},hill:{roll:["roll"]},downhill:{spd:["speed"]}};
 // 同じミスが続いたときに添える理由
 const WHY={sig:"合図は、周りの車や歩行者にこれからの動きを早めに知らせるためのものです。",look:"ミラーには死角があるので、振り向いて直接確認します。",pos:"曲がる前に寄せておくと、二輪車の巻き込みや後続車との接触を防げます。",speed:"速度を落としておくと、ハンドル操作と安全確認に余裕ができます。",stoppos:"停止線で確実に止まると、交差する車や歩行者を落ち着いて確認できます。",full:"完全に止まらないと、左右の確認が不十分なまま進んでしまいます。",entry:"カーブの中で減速すると車が不安定になるので、手前で速度を落とします。",window:"踏切では電車の音を聞くために窓を開けます。",roll:"坂道で下がると、後ろの車にぶつかるおそれがあります。",margin:"縁石との間に余裕を持つと、脱輪や接触を防げます。",edge:"左端に寄せて止まると、後ろから来る車の通行を妨げません。"};
+/* 段階評価：生の計測値はそのまま記録し、学習に使う「状態」は粗く区切る。
+   全項目を「閾値に対してどれだけ足りているか」で同じ5段階にそろえるので、
+   左折の寄せ・カーブの減速など項目が違っても、同じ段階のデータとしてまとめて学習できる。
+   1 大きく不足（閾値の50%超足りない）/ 2 不足 / 3 あと少し（15%以内）/ 4 合格 / 5 余裕で合格（閾値の30%以上の余裕）
+   数値のない項目（した・しない）は 不合格=2、合格=4。 */
+const LEVEL_CFG={far:0.5,close:0.15,comfy:0.3};
+function levelOf(c){
+ if(c.margin==null)return c.ok?4:2;
+ const th=Array.isArray(c.threshold)?Math.max(Math.abs(c.threshold[1]-c.threshold[0])/2,1e-9):Math.abs(c.threshold)||1;const rel=c.margin/th;
+ if(!c.ok)return -rel>LEVEL_CFG.far?1:-rel>LEVEL_CFG.close?2:3;
+ return rel>=LEVEL_CFG.comfy?5:4}
+/* 学習に使う状態＝段階（直近3回の中央値）× 傾き（上がっている/横ばい/下がっている）× 自立（促しなしでできているか）。
+   5×3×2＝30通りに収まるので、少ないデータでも1つの状態あたりの件数が溜まりやすい。 */
+function stateOf(it){
+ const h=it.hist.filter(x=>x.level!=null);if(!h.length)return {level:0,trend:"new",dep:"new",key:"L0|new"};
+ const r=h.slice(-3).map(x=>x.level).sort((a,b)=>a-b);const level=r[Math.floor(r.length/2)];
+ const d=h.length>=2?h[h.length-1].level-h[Math.max(0,h.length-3)].level:0;const trend=d>0?"up":d<0?"down":"flat";
+ const oks=h.slice(-3).filter(x=>x.ok);const dep=oks.length&&oks.filter(x=>x.helped).length*2>=oks.length+1?"dep":"self";
+ return {level,trend,dep,key:`L${level}|${trend}|${dep}`}}
 function newLearner(name){return {v:1,name:name||"生徒",sessions:0,items:{}}}
 function makeTeacher(course,learner,opt){
  const C=Object.assign({},TEACH_CFG,opt||{});const LN=learner||newLearner();const log=[];const pend={};const secSt={};
  const typeOf=id=>{const s=course.secs.find(x=>x.id===id);return s?s.type:null};
  const item=k=>LN.items[k]||(LN.items[k]={n:0,ok:0,fail:0,hist:[],testing:false,label:"",fix:""});
  const SS=id=>secSt[id]||(secSt[id]={helped:{},prevFail:{}});
- const snap=it=>({n:it.n,fail:it.fail,recent:it.hist.slice(-3).map(h=>(h.ok?"o":"x")+(h.helped?"+":"")),margins:it.hist.slice(-3).map(h=>h.margin==null?null:h.margin)});
  // 閾値に対する不足の割合（0.1＝閾値の10%足りない）。数値のない項目は null
  const shortRel=c=>{if(c.margin==null||c.margin>=0)return c.margin==null?null:0;const th=Array.isArray(c.threshold)?c.threshold[1]:c.threshold;return th?-c.margin/Math.abs(th):null};
+ const snap=it=>{const s=stateOf(it);return {n:it.n,fail:it.fail,level:s.level,trend:s.trend,dep:s.dep,stateKey:s.key,
+  recent:it.hist.slice(-3).map(h=>(h.ok?"o":"x")+(h.helped?"+":"")),margins:it.hist.slice(-3).map(h=>h.margin==null?null:h.margin)}};
  const decide=(t,sec,kind,keys,rule,action,text,why)=>{const ty=typeOf(sec);
   const d={id:log.length,t:Math.round(t*10)/10,sec,scene:ty,kind,keys,rule,action,text,why,policy:TEACH_VER,
    state:Object.fromEntries(keys.map(k=>[k,snap(item(ty+":"+k))])),outcome:{},reward:null};
@@ -1998,8 +2018,8 @@ function makeTeacher(course,learner,opt){
   const prevH=it.hist[it.hist.length-1];const margin=m.margin==null?null:m.margin;
   const delta=margin!=null&&prevH&&prevH.margin!=null?Math.round((margin-prevH.margin)*1000)/1000:null;
   ss.prevFail[m.key]=it.fail;it.n++;if(m.ok){it.ok++;it.fail=0}else it.fail++;it.label=m.text;it.fix=m.fix||it.fix;it.testing=false;it.unit=m.unit||it.unit;
-  it.hist.push({ok:!!m.ok,helped,t:Math.round(t*10)/10,value:m.value==null?null:m.value,margin});if(it.hist.length>C.hist)it.hist.shift();
-  (pend[ik]||[]).forEach(d=>{d.outcome[m.key]={ok:!!m.ok,helped,detail:m.detail||"",value:m.value==null?null:m.value,threshold:m.threshold==null?null:m.threshold,unit:m.unit||"",margin,delta,improved:delta!=null&&delta>0};
+  it.hist.push({ok:!!m.ok,helped,t:Math.round(t*10)/10,value:m.value==null?null:m.value,margin,level:levelOf(m)});if(it.hist.length>C.hist)it.hist.shift();
+  (pend[ik]||[]).forEach(d=>{d.outcome[m.key]={ok:!!m.ok,helped,detail:m.detail||"",value:m.value==null?null:m.value,threshold:m.threshold==null?null:m.threshold,unit:m.unit||"",margin,delta,improved:delta!=null&&delta>0,level:levelOf(m)};
    if(Object.keys(d.outcome).length===d.keys.length)d.reward=rewardOf(d)});
   delete pend[ik]}
  // 振り返り：不合格が複数あっても、いちばん大事な1つに絞る
@@ -2034,7 +2054,7 @@ function makeTeacher(course,learner,opt){
    byRule:by,rewardSum:rw.reduce((a,d)=>a+d.reward,0),rewarded:rw.length}}
  function finish(){LN.sessions++;Object.values(LN.items).forEach(it=>it.testing=false);return summary()}
  return {step,finish,summary,log,learner:LN}}
-return {makeTeacher,newLearner,TEACH_VER,AIK,AIK_CATS,AIKMAP,aikOf,aikScore,MISTAKE_UNOBS,SENSOR_CH,SENSOR_SRC,mistakeMax,OBS,OMAP,atomicOf,buildSegments,segAtS,segEnabled,segDefaults,REPORT22,makeCoach,coachSummary,SKILL,B_GROUPS,CAT6,cat6Of,evNames,makeMonitor,makeEdge,confS,MISTAKE_GROUPS,MISTAKE_DEF,SCALE,TD,TYPENAME,PARAMDEF,GLOBAL_DEF,GLOBAL_META,COURSES,GROUPS,ITEMS,IMAP,DANGER,PROFILES,MISTAKES,CH,STRIP,FIELDS,
+return {makeTeacher,newLearner,TEACH_VER,levelOf,stateOf,HINT_FOR,AIK,AIK_CATS,AIKMAP,aikOf,aikScore,MISTAKE_UNOBS,SENSOR_CH,SENSOR_SRC,mistakeMax,OBS,OMAP,atomicOf,buildSegments,segAtS,segEnabled,segDefaults,REPORT22,makeCoach,coachSummary,SKILL,B_GROUPS,CAT6,cat6Of,evNames,makeMonitor,makeEdge,confS,MISTAKE_GROUPS,MISTAKE_DEF,SCALE,TD,TYPENAME,PARAMDEF,GLOBAL_DEF,GLOBAL_META,COURSES,GROUPS,ITEMS,IMAP,DANGER,PROFILES,MISTAKES,CH,STRIP,FIELDS,
  buildCourse,pointAt,secAt,analyze,score,simulate,toCSV,parseCSV,encodeBits,decodeBits,criteriaText,applicableSecs,itemStatus,vAtLat};
 })();
 if(typeof module!=="undefined")module.exports=ENG;
