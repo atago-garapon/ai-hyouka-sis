@@ -1987,9 +1987,41 @@ function stateOf(it){
  const d=h.length>=2?h[h.length-1].level-h[Math.max(0,h.length-3)].level:0;const trend=d>0?"up":d<0?"down":"flat";
  const oks=h.slice(-3).filter(x=>x.ok);const dep=oks.length&&oks.filter(x=>x.helped).length*2>=oks.length+1?"dep":"self";
  return {level,trend,dep,key:`L${level}|${trend}|${dep}`}}
-function newLearner(name){return {v:1,name:name||"生徒",sessions:0,items:{}}}
+/* ===== 指導AI（Contextual Bandit bandit_v0.1）=====
+   決める場面ごとに、項目の状態（段階×傾き×自立）を文脈として、どの指導がいちばん Reward が高いかを学習する。
+     促し：言う / 言わない
+     振り返り：直し方を短く伝える / 理由まで説明する / 何も言わない
+   全体（この端末で走った全生徒）の傾向から始め、その生徒のデータが溜まるほど、その生徒向けの判断に寄せる。
+   選び方はトンプソン・サンプリング。選んだ確率（propensity）を必ず記録し、後でオフライン評価に使えるようにする。 */
+const BANDIT_VER="bandit_v0.1";
+const BANDIT_CFG={sigma:8,popCap:20,personal:5,eps:0.05,draws:64};
+function newBanditPop(){return {v:1,stats:{}}}
+function makeBandit(pop,opt,rand){
+ const C=Object.assign({},BANDIT_CFG,opt||{});const P=pop||newBanditPop();const R=rand||Math.random;
+ const cell=(S,ctx,arm)=>{const c=S[ctx]||(S[ctx]={});return c[arm]||(c[arm]={n:0,s:0})};
+ const gauss=()=>Math.sqrt(-2*Math.log(R()||1e-9))*Math.cos(2*Math.PI*R());
+ // 期待 Reward の見込み：全体の平均（データが少ないうちは0に寄せる）を、その生徒のデータで補正する
+ function belief(ctx,arm,LN){
+  const p=cell(P.stats,ctx,arm);const pm=p.s/(p.n+1);
+  const st=C.personal&&LN?cell((LN.bandit=LN.bandit||{}),ctx,arm):{n:0,s:0};
+  const mean=C.personal?(C.personal*pm+st.s)/(C.personal+st.n):pm;
+  const sd=C.sigma/Math.sqrt(1+Math.min(p.n,C.popCap)+st.n); // 全体のデータが多くても、生徒ごとに少しは試す
+  return {mean,sd,nPop:p.n,nStu:st.n}}
+ function choose(ctx,arms,LN){
+  const b=arms.map(a=>belief(ctx,a,LN));const win=arms.map(()=>0);
+  for(let i=0;i<C.draws;i++){let bi=0,bv=-Infinity;b.forEach((x,j)=>{const v=x.mean+x.sd*gauss();if(v>bv){bv=v;bi=j}});win[bi]++}
+  const prob=win.map(w=>(1-C.eps)*w/C.draws+C.eps/arms.length);
+  let u=R(),k=0;while(k<arms.length-1&&u>prob[k]){u-=prob[k];k++}
+  const r2=x=>Math.round(x*1000)/1000;
+  return {arm:arms[k],prob:r2(prob[k]),probs:Object.fromEntries(arms.map((a,j)=>[a,r2(prob[j])])),
+   belief:Object.fromEntries(arms.map((a,j)=>[a,{mean:Math.round(b[j].mean*100)/100,n:b[j].nPop,nStudent:b[j].nStu}]))}}
+ function update(ctx,arm,r,LN){const p=cell(P.stats,ctx,arm);p.n++;p.s+=r;if(C.personal&&LN){const st=cell((LN.bandit=LN.bandit||{}),ctx,arm);st.n++;st.s+=r}}
+ return {choose,update,pop:P,ver:BANDIT_VER}}
+function newLearner(name){return {v:1,name:name||"生徒",sessions:0,items:{},pendB:{}}}
+// opt.bandit を渡すと、促しと振り返りの判断を Contextual Bandit が行う（安全側の決まりはルールのまま）
 function makeTeacher(course,learner,opt){
- const C=Object.assign({},TEACH_CFG,opt||{});const LN=learner||newLearner();const log=[];const pend={};const secSt={};
+ const C=Object.assign({},TEACH_CFG,opt||{});const LN=learner||newLearner();const B=C.bandit||null;const VER=B?BANDIT_VER:TEACH_VER;
+ const log=[];const pend={};const secSt={};LN.pendB=LN.pendB||{};
  const typeOf=id=>{const s=course.secs.find(x=>x.id===id);return s?s.type:null};
  const item=k=>LN.items[k]||(LN.items[k]={n:0,ok:0,fail:0,hist:[],testing:false,label:"",fix:""});
  const SS=id=>secSt[id]||(secSt[id]={helped:{},prevFail:{}});
@@ -1997,17 +2029,27 @@ function makeTeacher(course,learner,opt){
  const shortRel=c=>{if(c.margin==null||c.margin>=0)return c.margin==null?null:0;const th=Array.isArray(c.threshold)?c.threshold[1]:c.threshold;return th?-c.margin/Math.abs(th):null};
  const snap=it=>{const s=stateOf(it);return {n:it.n,fail:it.fail,level:s.level,trend:s.trend,dep:s.dep,stateKey:s.key,
   recent:it.hist.slice(-3).map(h=>(h.ok?"o":"x")+(h.helped?"+":"")),margins:it.hist.slice(-3).map(h=>h.margin==null?null:h.margin)}};
- const decide=(t,sec,kind,keys,rule,action,text,why)=>{const ty=typeOf(sec);
-  const d={id:log.length,t:Math.round(t*10)/10,sec,scene:ty,kind,keys,rule,action,text,why,policy:TEACH_VER,
-   state:Object.fromEntries(keys.map(k=>[k,snap(item(ty+":"+k))])),outcome:{},reward:null};
+ const decide=(t,sec,kind,keys,rule,action,text,why,extra)=>{const ty=typeOf(sec);
+  const d=Object.assign({id:log.length,t:Math.round(t*10)/10,sec,scene:ty,kind,keys,rule,action,text,why,policy:VER,
+   state:Object.fromEntries(keys.map(k=>[k,snap(item(ty+":"+k))])),outcome:{},reward:null},extra||{});
   log.push(d);keys.forEach(k=>(pend[ty+":"+k]=pend[ty+":"+k]||[]).push(d));return d};
- const rewardOf=d=>{const R=C.reward;let r=d.action==="say"?R.say:0;
-  Object.values(d.outcome).forEach(o=>{r+=o.ok?R.ok:R.ng;if(o.ok&&!o.helped&&d.action==="suppress")r+=R.indep;if(!o.ok&&o.improved)r+=R.improve});return r};
+ // Reward：自分で（促しなしで）できたことを最も高く、言ったことには小さなコストをつける
+ const rewardOf=(said,outs)=>{const R=C.reward;let r=said?R.say:0;
+  outs.forEach(o=>{r+=o.ok?R.ok:R.ng;if(o.ok&&!o.helped)r+=R.indep;if(!o.ok&&o.improved)r+=R.improve});return r};
+ // Bandit の判断は教習をまたいで結果を待つので、生徒の記録側に置く
+ const waitB=(ty,keys,ctx,arm,said)=>{const w={ctx,arm,said,keys,outs:{}};keys.forEach(k=>{const l=LN.pendB[ty+":"+k]=LN.pendB[ty+":"+k]||[];l.push(w);if(l.length>5)l.shift()})};
+ const worstState=(ty,keys)=>keys.map(k=>stateOf(item(ty+":"+k))).sort((a,b)=>a.level-b.level)[0];
  // 促しを言うか（true）止めるか（false）
  function gateHint(m,t){
   const ty=typeOf(m.sec);const keys=(HINT_FOR[ty]||{})[m.key];
   if(!keys){decide(t,m.sec,"hint",[],"H0","say",m.text,"周りの状況の知らせなど、止めない促し");return true}
-  const its=keys.map(k=>item(ty+":"+k));const okRun=n=>its.every(it=>it.hist.length>=n&&it.hist.slice(-n).every(h=>h.ok));
+  const its=keys.map(k=>item(ty+":"+k));
+  if(B&&its.every(it=>it.hist.length)){
+   const st=worstState(ty,keys);const ctx="hint|"+st.key;const ch=B.choose(ctx,["say","suppress"],LN);const say=ch.arm==="say";
+   if(say)keys.forEach(k=>SS(m.sec).helped[k]=true);
+   decide(t,m.sec,"hint",keys,"B",say?"say":"suppress",m.text,`文脈 ${st.key}：言う${ch.probs.say} / 言わない${ch.probs.suppress}`,{ctx,arm:ch.arm,prob:ch.prob,probs:ch.probs,belief:ch.belief});
+   waitB(ty,keys,ctx,ch.arm,say);return say}
+  const okRun=n=>its.every(it=>it.hist.length>=n&&it.hist.slice(-n).every(h=>h.ok));
   if(okRun(C.indepStreak)&&its.every(it=>!it.hist[it.hist.length-1].helped)){
    decide(t,m.sec,"hint",keys,"H1","suppress",m.text,"直近は促しなしでできている");return false}
   if(okRun(C.depStreak)&&its.every(it=>it.hist.slice(-C.depStreak).every(h=>h.helped))&&!its.some(it=>it.testing)){
@@ -2019,21 +2061,33 @@ function makeTeacher(course,learner,opt){
   const delta=margin!=null&&prevH&&prevH.margin!=null?Math.round((margin-prevH.margin)*1000)/1000:null;
   ss.prevFail[m.key]=it.fail;it.n++;if(m.ok){it.ok++;it.fail=0}else it.fail++;it.label=m.text;it.fix=m.fix||it.fix;it.testing=false;it.unit=m.unit||it.unit;
   it.hist.push({ok:!!m.ok,helped,t:Math.round(t*10)/10,value:m.value==null?null:m.value,margin,level:levelOf(m)});if(it.hist.length>C.hist)it.hist.shift();
-  (pend[ik]||[]).forEach(d=>{d.outcome[m.key]={ok:!!m.ok,helped,detail:m.detail||"",value:m.value==null?null:m.value,threshold:m.threshold==null?null:m.threshold,unit:m.unit||"",margin,delta,improved:delta!=null&&delta>0,level:levelOf(m)};
-   if(Object.keys(d.outcome).length===d.keys.length)d.reward=rewardOf(d)});
-  delete pend[ik]}
+  const o={ok:!!m.ok,helped,detail:m.detail||"",value:m.value==null?null:m.value,threshold:m.threshold==null?null:m.threshold,unit:m.unit||"",margin,delta,improved:delta!=null&&delta>0,level:levelOf(m)};
+  (pend[ik]||[]).forEach(d=>{d.outcome[m.key]=o;if(Object.keys(d.outcome).length===d.keys.length)d.reward=rewardOf(d.action==="say",Object.values(d.outcome))});
+  delete pend[ik];
+  if(B)(LN.pendB[ik]||[]).forEach(w=>{w.outs[m.key]=o;if(Object.keys(w.outs).length===w.keys.length)B.update(w.ctx,w.arm,rewardOf(w.said,Object.values(w.outs)),LN)});
+  delete LN.pendB[ik]}
  // 振り返り：不合格が複数あっても、いちばん大事な1つに絞る
  function onReview(m,t){
   const ty=typeOf(m.sec);const ss=SS(m.sec);const ng=m.items.filter(i=>!i.ok&&i.key);
   if(!ng.length){const rec=m.items.find(i=>i.key&&(ss.prevFail[i.key]||0)>=1);
    if(rec){m.praise=`前回できなかった「${rec.label}」、今回はできました`;decide(t,m.sec,"review",[rec.key],"V6","say",m.praise,"前回の不合格から改善")}return}
   const pr=i=>(C.w[i.skill]||1)*(1+item(ty+":"+i.key).fail);const f=ng.slice().sort((a,b)=>pr(b)-pr(a))[0];const n=item(ty+":"+f.key).fail;
-  let rule="V5",text=f.fix||f.label;const why=WHY[f.key]?`。${WHY[f.key]}`:"。";
-  if(n>=C.escalateAfter){rule="V1";m.escalate=true;text=`${text}${why}教習の後で指導員と一緒に振り返りましょう`}
-  else if(n>=C.explainAfter){rule="V2";text=`${text}${WHY[f.key]?why:""}`}
-  const sr=shortRel(f);if(rule==="V5"&&sr!=null&&sr<=C.closeRel){rule="V4";text=`あと少しです（${f.detail}）。${text}`}
-  m.focus={key:f.key,label:f.label,text,rule,value:f.value==null?null:f.value,margin:f.margin==null?null:f.margin};m.fixes=[text].concat((m.fixes||[]).filter(x=>x!==f.fix));
-  decide(t,m.sec,"review",[f.key],rule,"say",text,n>1?`${n}回続けてできていない`:"1回目のミス")}
+  const why=WHY[f.key]?`。${WHY[f.key]}`:"。";const sr=shortRel(f);const close=sr!=null&&sr<=C.closeRel;
+  const fixText=close?`あと少しです（${f.detail}）。${f.fix||f.label}`:(f.fix||f.label);
+  const setFocus=(rule,text)=>{m.focus={key:f.key,label:f.label,text,rule,value:f.value==null?null:f.value,margin:f.margin==null?null:f.margin};m.fixes=[text].concat((m.fixes||[]).filter(x=>x!==f.fix))};
+  const whyN=n>1?`${n}回続けてできていない`:"1回目のミス";
+  // 5回続けて失敗したら、Bandit に任せず指導員に引き継ぐ
+  if(n>=C.escalateAfter){const text=`${f.fix||f.label}${why}教習の後で指導員と一緒に振り返りましょう`;m.escalate=true;setFocus("V1",text);decide(t,m.sec,"review",[f.key],"V1","say",text,whyN);return}
+  if(B){
+   const st=stateOf(item(ty+":"+f.key));const ctx="review|"+st.key;const arms=WHY[f.key]?["fix","explain","none"]:["fix","none"];const ch=B.choose(ctx,arms,LN);
+   const extra={ctx,arm:ch.arm,prob:ch.prob,probs:ch.probs,belief:ch.belief};
+   if(ch.arm==="none"){m.fixes=[];decide(t,m.sec,"review",[f.key],"B","suppress","",`文脈 ${st.key}：何も言わない`,extra);waitB(ty,[f.key],ctx,ch.arm,false);return}
+   const text=ch.arm==="explain"?`${f.fix||f.label}${why}`:fixText;setFocus("B",text);
+   decide(t,m.sec,"review",[f.key],"B","say",text,`文脈 ${st.key}：${ch.arm==="explain"?"理由まで説明":"直し方を伝える"}`,extra);waitB(ty,[f.key],ctx,ch.arm,true);return}
+  let rule="V5",text=f.fix||f.label;
+  if(n>=C.explainAfter){rule="V2";text=`${text}${WHY[f.key]?why:""}`}
+  else if(close){rule="V4";text=fixText}
+  setFocus(rule,text);decide(t,m.sec,"review",[f.key],rule,"say",text,whyN)}
  // 予告：同じ場面で続けて失敗している項目があれば、事前に一言足す
  function onPre(m,t,out){
   const ty=typeOf(m.sec);const ks=Object.keys(LN.items).filter(k=>k.split(":")[0]===ty&&LN.items[k].fail>=C.remindAfter);if(!ks.length)return;
@@ -2050,11 +2104,11 @@ function makeTeacher(course,learner,opt){
    if(m.type==="pre")onPre(m,q.t,out)});
   return out}
  function summary(){const by={};log.forEach(d=>by[d.rule]=(by[d.rule]||0)+1);const rw=log.filter(d=>d.reward!=null);
-  return {policy:TEACH_VER,decisions:log.length,said:log.filter(d=>d.action==="say").length,suppressed:log.filter(d=>d.action==="suppress").length,
+  return {policy:VER,decisions:log.length,said:log.filter(d=>d.action==="say").length,suppressed:log.filter(d=>d.action==="suppress").length,
    byRule:by,rewardSum:rw.reduce((a,d)=>a+d.reward,0),rewarded:rw.length}}
  function finish(){LN.sessions++;Object.values(LN.items).forEach(it=>it.testing=false);return summary()}
- return {step,finish,summary,log,learner:LN}}
-return {makeTeacher,newLearner,TEACH_VER,levelOf,stateOf,HINT_FOR,AIK,AIK_CATS,AIKMAP,aikOf,aikScore,MISTAKE_UNOBS,SENSOR_CH,SENSOR_SRC,mistakeMax,OBS,OMAP,atomicOf,buildSegments,segAtS,segEnabled,segDefaults,REPORT22,makeCoach,coachSummary,SKILL,B_GROUPS,CAT6,cat6Of,evNames,makeMonitor,makeEdge,confS,MISTAKE_GROUPS,MISTAKE_DEF,SCALE,TD,TYPENAME,PARAMDEF,GLOBAL_DEF,GLOBAL_META,COURSES,GROUPS,ITEMS,IMAP,DANGER,PROFILES,MISTAKES,CH,STRIP,FIELDS,
+ return {step,finish,summary,log,learner:LN,bandit:B}}
+return {makeTeacher,newLearner,TEACH_VER,makeBandit,newBanditPop,BANDIT_VER,levelOf,stateOf,HINT_FOR,AIK,AIK_CATS,AIKMAP,aikOf,aikScore,MISTAKE_UNOBS,SENSOR_CH,SENSOR_SRC,mistakeMax,OBS,OMAP,atomicOf,buildSegments,segAtS,segEnabled,segDefaults,REPORT22,makeCoach,coachSummary,SKILL,B_GROUPS,CAT6,cat6Of,evNames,makeMonitor,makeEdge,confS,MISTAKE_GROUPS,MISTAKE_DEF,SCALE,TD,TYPENAME,PARAMDEF,GLOBAL_DEF,GLOBAL_META,COURSES,GROUPS,ITEMS,IMAP,DANGER,PROFILES,MISTAKES,CH,STRIP,FIELDS,
  buildCourse,pointAt,secAt,analyze,score,simulate,toCSV,parseCSV,encodeBits,decodeBits,criteriaText,applicableSecs,itemStatus,vAtLat};
 })();
 if(typeof module!=="undefined")module.exports=ENG;
@@ -2558,7 +2612,7 @@ async function startTablet(blob,label){
   TB.cur=null;TB.guide={};
   const v=$("#tbVideo");v.muted=true;v.playsInline=true;v.playbackRate=+(($("#tbRate2 [aria-pressed=true]")||{dataset:{r:1}}).dataset.r);
   let url=URL.createObjectURL(blob);const gl=Object.assign({},settings.global,{__video:true,__secOff:((settings.secOff||{})[meta.course])||{},__segSel:((settings.segSel||{})[meta.course])||{}});
-  live={smp:[],k:0,t0:null,nextEval:null,seen:{},feed:[],revoked:0,ms:[],ded:0,ints:0,mon:E.makeMonitor(course,gl),edge:E.makeEdge(),gl,on:true,video:true,vmap:[],label,coach:E.makeCoach(course,gl),coachAll:[],teacher:TEACH.on?E.makeTeacher(course,TEACH.learner()):null};
+  live={smp:[],k:0,t0:null,nextEval:null,seen:{},feed:[],revoked:0,ms:[],ded:0,ints:0,mon:E.makeMonitor(course,gl),edge:E.makeEdge(),gl,on:true,video:true,vmap:[],label,coach:E.makeCoach(course,gl),coachAll:[],teacher:TEACH.make(course)};
   const L=live;L.vtOf=t=>{const m=L.vmap;if(!m.length)return 0;let lo=0,hi=m.length-1;if(t<=m[0][0])return m[0][1];if(t>=m[hi][0])return m[hi][1];while(hi-lo>1){const mid=(lo+hi)>>1;if(m[mid][0]<=t)lo=mid;else hi=mid}return m[lo][1]};
   L.onCoach=(ms,q)=>{ms.forEach(m=>{const tm=mmss(q.t-L.t0);
     if(m.type==="voice"){voSay(m.text,m.kind);return}
@@ -2584,7 +2638,7 @@ async function startTablet(blob,label){
 }
 function tbEnd(){
   const sm=E.coachSummary(live.coachAll);const r=res;const box=$("#tbEnd");box.hidden=false;
-  const T=live.teacher;let tsm=null;if(T){tsm=T.finished||(T.finished=T.finish());TEACH.save(T.learner);TEACH.lastLog=T.log}
+  const T=live.teacher;let tsm=null;if(T){tsm=T.finished||(T.finished=T.finish());TEACH.save(T);TEACH.lastLog=T.log}
   const bars=Object.entries(sm.by).map(([k,v])=>`<div class="row"><span>${esc(E.SKILL[k]||k)}</span><span class="b"><i style="width:${Math.round(v.ok/v.n*100)}%;${v.ok<v.n?"background:#ffb300":""}"></i></span><span>${v.ok}/${v.n}</span></div>`).join("");
   box.innerHTML=`<div class="box"><h2 style="margin:0 0 6px">今回の練習のふりかえり</h2>
    <div style="display:flex;gap:18px;margin:6px 0 10px"><div><small class="muted">指導の達成</small><div style="font-size:30px;font-weight:800">${sm.rate}%</div><small class="muted">${sm.ok}/${sm.n}項目</small></div><div><small class="muted">検定換算</small><div style="font-size:30px;font-weight:800">${r?r.score:"-"}点</div><small class="muted">${r?esc(r.judge):""}</small></div></div>
@@ -2642,11 +2696,20 @@ $("#tbRate2").addEventListener("click",e=>{const b=e.target.closest("[data-r]");
 $("#tbVideo").addEventListener("click",()=>{const v=$("#tbVideo");if(v.paused)v.play().catch(()=>{});});
 function openTablet(blob,label){TB.blob=blob;TB.label=label;voUnlock();startTablet(blob,label)}
 $("#tbVoice").addEventListener("click",e=>{VO.on=!VO.on;e.currentTarget.setAttribute("aria-pressed",VO.on);e.currentTarget.textContent=VO.on?"🔊 音声":"🔇 音声";if(!VO.on){try{speechSynthesis.cancel()}catch(x){}VO.q=[];VO.busy=false}});
-/* 指導AI：生徒の記録はこの端末の localStorage に保存し、教習をまたいで引き継ぐ */
-const TEACH={on:store.get("aid3_teach_on",true),lastLog:null,
-  learner(){return store.get("aid3_learner",null)||E.newLearner()},save(l){store.set("aid3_learner",l)},reset(){store.set("aid3_learner",null)}};
-{const b=$("#tbTeach");b.setAttribute("aria-pressed",TEACH.on);b.textContent=TEACH.on?"🎓 指導AI":"🎓 指導AI オフ"}
-$("#tbTeach").addEventListener("click",e=>{TEACH.on=!TEACH.on;store.set("aid3_teach_on",TEACH.on);e.currentTarget.setAttribute("aria-pressed",TEACH.on);e.currentTarget.textContent=TEACH.on?"🎓 指導AI":"🎓 指導AI オフ";toast(TEACH.on?"指導AI：次の再生から、生徒ごとに促しを調整します":"指導AI オフ：次の再生から、元の指導モデルのまま全部言います")});
+/* 指導AI：ルール（rule）/ 学習型（bandit）/ オフ を切り替える。
+   生徒の記録と、学習型が全生徒から学んだ表は、この端末の localStorage に保存して教習をまたいで引き継ぐ */
+const TEACH_MODES={rule:["🎓 指導AI：ルール","指導AI（ルール）：次の再生から、決めたルールで促しを調整します"],
+  bandit:["🎓 指導AI：学習型","指導AI（学習型）：次の再生から、これまでの結果をもとに言う・言わないを選びます"],
+  off:["🎓 指導AI：オフ","指導AI オフ：次の再生から、元の指導モデルのまま全部言います"]};
+const TEACH={mode:store.get("aid3_teach_mode",store.get("aid3_teach_on",true)===false?"off":"rule"),lastLog:null,
+  learner(){return store.get("aid3_learner",null)||E.newLearner()},
+  make(c){if(TEACH.mode==="off"||!TEACH_MODES[TEACH.mode])return null;
+    return E.makeTeacher(c,TEACH.learner(),TEACH.mode==="bandit"?{bandit:E.makeBandit(store.get("aid3_bandit",null))}:{})},
+  save(T){store.set("aid3_learner",T.learner);if(T.bandit)store.set("aid3_bandit",T.bandit.pop)},
+  reset(){store.set("aid3_learner",null)},
+  show(){const b=$("#tbTeach");b.setAttribute("aria-pressed",TEACH.mode!=="off");b.textContent=TEACH_MODES[TEACH.mode][0]}};
+TEACH.show();
+$("#tbTeach").addEventListener("click",()=>{const order=["rule","bandit","off"];TEACH.mode=order[(order.indexOf(TEACH.mode)+1)%order.length];store.set("aid3_teach_mode",TEACH.mode);TEACH.show();toast(TEACH_MODES[TEACH.mode][1])});
 $("#tbMode").addEventListener("click",e=>{const b=e.target.closest("[data-m]");if(!b)return;VO.mode=b.dataset.m;$$("#tbMode button").forEach(x=>x.setAttribute("aria-pressed",x===b));toast(VO.mode==="exam"?"検定モード：音声は道案内だけ":"練習モード：道案内と行動の促し")});
 function stopLive(silent){if(live)live.on=false;try{const v=$("#lvVideo");if(v&&!v.paused)v.pause();const tv=$("#tbVideo");if(tv&&!tv.paused&&!(live&&live.on))tv.pause()}catch(e){}$("#liveBtn").textContent="⚡ リアルタイム採点";if(!silent&&live)$("#liveState").textContent="停止しました"}
 function liveEval(final){

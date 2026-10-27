@@ -105,13 +105,23 @@ function toCheck(item, perf) {
   return { ok, value: Math.round(value * 1000) / 1000, margin, detail: `${Math.round(value * 100) / 100}${item.unit || ""}` };
 }
 
-// ---------- 指導の出し方（比べる3通り） ----------
-// rule   : 指導AI rule_v0.1（makeTeacher）
-// always : 元の指導モデルのまま。促しは全部言い、振り返りは最初に見つかった不合格を伝える
-// silent : 何も言わない（走るだけ）
-function makePolicy(kind, course, learner) {
-  if (kind === "rule") {
-    const T = E.makeTeacher(course, learner);
+// ---------- 指導の出し方（比べる5通り） ----------
+// rule       : 指導AI rule_v0.1（makeTeacher）
+// bandit     : 指導AI bandit_v0.1。全体の傾向＋その生徒のデータで判断する
+// bandit_pop : bandit_v0.1 で、全体の傾向だけで判断する（生徒ごとの補正なし）
+// always     : 元の指導モデルのまま。促しは全部言い、振り返りは最初に見つかった不合格を伝える
+// silent     : 何も言わない（走るだけ）
+const POLICIES = {
+  rule: "指導AI ルール",
+  bandit: "指導AI Bandit（生徒別）",
+  bandit_pop: "指導AI Bandit（全体のみ）",
+  always: "元の指導（全部言う）",
+  silent: "何も言わない",
+};
+
+function makePolicy(kind, course, learner, bandit) {
+  if (kind === "rule" || kind === "bandit" || kind === "bandit_pop") {
+    const T = E.makeTeacher(course, learner, bandit ? { bandit } : {});
     return {
       // 渡したメッセージのうち、言ったもの・決めたことを返す
       run(msgs, t) {
@@ -141,7 +151,7 @@ function makePolicy(kind, course, learner) {
 }
 
 // ---------- 1回の教習 ----------
-function runLesson(cat, student, policy, r) {
+function runLesson(cat, student, policy) {
   const stat = { attempts: 0, ok: 0, selfOk: 0, voice: 0, reviews: 0 };
   let t = 0;
   for (const sec of cat.secs) {
@@ -201,92 +211,111 @@ function runLesson(cat, student, policy, r) {
       student.learn(i.ik, student.p.practice);
       if (i.ok) student.learn(i.ik, i.helped ? student.p.hinted : student.p.self);
     });
-    // 振り返りで指摘された項目
+    // 振り返りで伝えた項目（理由まで説明したか、直し方だけか）
     res.decisions
-      .filter((d) => d.kind === "review" && d.rule !== "V6")
+      .filter((d) => d.kind === "review" && d.action === "say" && d.rule !== "V6")
       .forEach((d) => {
         stat.reviews++;
-        const amount = d.rule === "V2" || d.rule === "V1" ? student.p.explain : student.p.review;
-        d.keys.forEach((k) => student.learn(`${sec.type}:${k}`, amount));
+        const explained = d.rule === "V2" || d.rule === "V1" || d.arm === "explain";
+        d.keys.forEach((k) => student.learn(`${sec.type}:${k}`, explained ? student.p.explain : student.p.review));
       });
   }
   return stat;
 }
 
 // ---------- 実験 ----------
-function experiment({ students = 200, lessons = 10, seed = 1 } = {}) {
+// 3タイプの生徒が順番に混ざって入校する。Bandit は前の生徒たちのデータを引き継いで学習していく。
+function experiment({ students = 200, lessons = 10, seed = 1, policies = Object.keys(POLICIES) } = {}) {
   const cats = [buildCatalog("c1"), buildCatalog("c2")];
+  const types = Object.keys(PROFILES);
+  const total = students * types.length;
   const results = {};
-  const stateCount = {};
-  let decisionsWithState = 0;
-
-  for (const [pk, prof] of Object.entries(PROFILES)) {
-    for (const pol of ["rule", "always", "silent"]) {
-      const per = Array.from({ length: lessons }, () => ({ attempts: 0, ok: 0, selfOk: 0, voice: 0, reviews: 0 }));
-      for (let s = 0; s < students; s++) {
-        const r = rng(seed * 100003 + s * 7919 + pk.length);
-        const student = new VirtualStudent(prof, r);
-        const learner = E.newLearner(`sim-${pk}-${s}`);
-        for (let l = 0; l < lessons; l++) {
-          const cat = cats[l % cats.length];
-          const policy = makePolicy(pol, cat.course, learner);
-          const st = runLesson(cat, student, policy, r);
-          policy.finish();
-          if (pol === "rule")
-            policy.log.forEach((d) =>
-              Object.values(d.state).forEach((sv) => {
-                stateCount[sv.stateKey] = (stateCount[sv.stateKey] || 0) + 1;
-                decisionsWithState++;
-              })
-            );
-          for (const k in st) per[l][k] += st[k];
-          student.forget();
+  const banditPops = {};
+  for (const pol of policies) {
+    const br = rng(seed * 31 + pol.length);
+    const bandit = pol.startsWith("bandit") ? E.makeBandit(null, { personal: pol === "bandit" ? 5 : 0 }, br.next) : null;
+    const per = {};
+    types.forEach((ty) => (per[ty] = Array.from({ length: lessons }, () => ({ attempts: 0, ok: 0, selfOk: 0, voice: 0, reviews: 0, n: 0 }))));
+    const cohort = []; // 入校順ごとの最終回の自力合格率（Bandit の学習の進み方を見る）
+    const suppressShare = {};
+    for (let s = 0; s < total; s++) {
+      const ty = types[s % types.length];
+      const r = rng(seed * 100003 + s * 7919);
+      const student = new VirtualStudent(PROFILES[ty], r);
+      const learner = E.newLearner(`sim-${s}`);
+      let last = null;
+      for (let l = 0; l < lessons; l++) {
+        const cat = cats[l % cats.length];
+        const policy = makePolicy(pol, cat.course, learner, bandit);
+        const st = runLesson(cat, student, policy);
+        policy.finish();
+        if (bandit && l === lessons - 1) {
+          const hs = policy.log.filter((d) => d.kind === "hint" && d.rule === "B");
+          const sp = (suppressShare[ty] = suppressShare[ty] || { n: 0, s: 0 });
+          sp.n += hs.length;
+          sp.s += hs.filter((d) => d.action === "suppress").length;
         }
+        for (const k in st) per[ty][l][k] += st[k];
+        per[ty][l].n++;
+        last = st;
+        student.forget();
       }
-      results[`${pk}/${pol}`] = per.map((x) => ({
-        okRate: x.ok / x.attempts,
-        selfRate: x.selfOk / x.attempts,
-        voice: x.voice / students,
-        reviews: x.reviews / students,
-      }));
+      cohort.push(last.selfOk / last.attempts);
     }
+    results[pol] = { per, cohort, suppressShare };
+    if (bandit) banditPops[pol] = bandit.pop;
   }
-  return { results, stateCount, decisionsWithState };
+  return { results, banditPops, types, lessons };
 }
 
 // ---------- 表示 ----------
-function pct(x) {
-  return `${Math.round(x * 100)}%`.padStart(4);
-}
+const pct = (x) => `${Math.round(x * 100)}%`.padStart(4);
+const avg = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+// 全角を2文字分として右を空白でそろえる
+const padW = (s, w) => s + " ".repeat(Math.max(0, w - [...s].reduce((n, ch) => n + (ch.charCodeAt(0) > 0xff ? 2 : 1), 0)));
 
 if (require.main === module) {
   const students = +(process.argv[2] || 200);
   const lessons = +(process.argv[3] || 10);
   const t0 = Date.now();
-  const { results, stateCount, decisionsWithState } = experiment({ students, lessons });
-  const POL = { rule: "指導AI（rule_v0.1）", always: "元の指導（全部言う）", silent: "何も言わない　　　　" };
-  console.log(`生徒 ${students}人 × 教習 ${lessons}回（コース c1/c2 を交互）  ${((Date.now() - t0) / 1000).toFixed(1)}秒\n`);
-  console.log("自力合格率 = 促し・予告なしで合格した割合（最終的に目指すもの）");
-  console.log("促し/回    = 1回の教習で声に出した促し・予告の数\n");
-  for (const [pk, prof] of Object.entries(PROFILES)) {
-    console.log(`■ ${prof.name}`);
-    console.log("  指導の出し方         | 1回目 自力 促し/回 | 最終回 合格 自力 促し/回");
-    for (const pol of ["rule", "always", "silent"]) {
-      const r = results[`${pk}/${pol}`];
-      const a = r[0];
-      const z = r[r.length - 1];
-      console.log(
-        `  ${POL[pol]} |       ${pct(a.selfRate)} ${a.voice.toFixed(1).padStart(6)} |        ${pct(z.okRate)} ${pct(z.selfRate)} ${z.voice.toFixed(1).padStart(6)}`
-      );
+  const { results, banditPops, types } = experiment({ students, lessons });
+  console.log(`3タイプ × 各${students}人が順に入校、1人あたり教習 ${lessons}回（コース c1/c2 を交互）  ${((Date.now() - t0) / 1000).toFixed(1)}秒\n`);
+  console.log("自力合格率 = 促し・予告なしで合格した割合（最終的に目指すもの）／促し/回 = 1回の教習で声に出した促し・予告の数\n");
+  for (const ty of types) {
+    console.log(`■ ${PROFILES[ty].name}（最終回）`);
+    console.log(`  ${padW("指導の出し方", 28)}合格  自力  促し/回`);
+    for (const pol of Object.keys(results)) {
+      const z = results[pol].per[ty][lessons - 1];
+      console.log(`  ${padW(POLICIES[pol], 27)}${pct(z.ok / z.attempts)}  ${pct(z.selfOk / z.attempts)}  ${(z.voice / z.n).toFixed(1).padStart(6)}`);
     }
     console.log("");
   }
-  const keys = Object.entries(stateCount).sort((a, b) => b[1] - a[1]);
-  const counts = keys.map((x) => x[1]).sort((a, b) => a - b);
-  console.log(`■ 段階評価でまとめた「状態」の数（指導AIの判断 ${decisionsWithState} 件）`);
-  console.log(`  使われた状態: ${keys.length} 通り（上限 5段階×3傾き×2自立＋新規 = 31）`);
-  console.log(`  1つの状態あたりの件数: 中央値 ${counts[Math.floor(counts.length / 2)]} 件 / 最少 ${counts[0]} 件`);
-  console.log(`  多い順: ${keys.slice(0, 6).map(([k, v]) => `${k}=${v}`).join("  ")}`);
+  for (const pol of ["bandit", "bandit_pop"]) {
+    if (!results[pol]) continue;
+    const c = results[pol].cohort;
+    const sh = results[pol].suppressShare;
+    const buckets = [[0, 3], [3, 9], [9, 30], [30, 120], [120, c.length]].filter(([a]) => a < c.length);
+    console.log(`■ ${POLICIES[pol]}`);
+    console.log(`  入校順ごとの最終回の自力合格率（データが溜まるほど良くなるか）:`);
+    console.log("   " + buckets.map(([a, b]) => `${a + 1}〜${Math.min(b, c.length)}人目 ${pct(avg(c.slice(a, b)))}`).join(" → "));
+    console.log(`  最終回に促しを「あえて言わなかった」割合: ${types.map((ty) => `${PROFILES[ty].name} ${pct(sh[ty].s / Math.max(1, sh[ty].n))}`).join(" / ")}`);
+  }
+  const pop = banditPops.bandit;
+  if (pop) {
+    const cells = [];
+    for (const [ctx, arms] of Object.entries(pop.stats)) for (const [arm, c] of Object.entries(arms)) cells.push({ ctx, arm, n: c.n, mean: c.s / Math.max(1, c.n) });
+    const ns = cells.map((c) => c.n).sort((a, b) => a - b);
+    const ctxs = new Set(cells.map((c) => c.ctx));
+    console.log(`\n■ Bandit が学習した表（文脈 ${ctxs.size} 通り × 指導の選択肢 = ${cells.length} マス、1マスの件数 中央値 ${ns[Math.floor(ns.length / 2)]} 件）`);
+    const show = [...ctxs]
+      .map((ctx) => ({ ctx, n: cells.filter((c) => c.ctx === ctx).reduce((a, c) => a + c.n, 0) }))
+      .sort((a, b) => b.n - a.n)
+      .slice(0, 8);
+    for (const { ctx } of show) {
+      const cs = cells.filter((c) => c.ctx === ctx).sort((a, b) => b.mean - a.mean);
+      console.log(`  ${ctx.padEnd(22)} ${cs.map((c) => `${c.arm} ${c.mean.toFixed(1)}(${c.n})`).join("  ")}`);
+    }
+  }
 }
 
-module.exports = { experiment, buildCatalog, VirtualStudent, PROFILES, toCheck };
+module.exports = { experiment, buildCatalog, VirtualStudent, PROFILES, POLICIES, toCheck };
