@@ -1789,7 +1789,12 @@ function makeCoach(course,gset){
  const g=Object.assign({},GLOBAL_DEF,gset||{});const VH=g.vehW/2;const st={};const out=[];const hist=[];let prev=null;let t0=null;
  const S=sec=>st[sec.id]||(st[sec.id]={pre:false,ck:{},items:[],done:false,warn:{},vmax:0,offs:[],minM:9,rev:0});
  const say=(type,sec,text,x)=>out.push(Object.assign({type,sec:sec?sec.id:null,scene:sec?sec.name:"",text},x||{}));
- const mark=(sec,key,skill,ok,label,detail,fix)=>{const s=S(sec);if(s.ck[key]!=null)return;s.ck[key]=ok;const it={key,skill,ok,label,detail,fix};s.items.push(it);say("check",sec,label,{key,ok,detail,fix,skill})};
+ // num：合否の判定に使った計測値を数値のまま出す（判定には使わない。合否は ok の式だけで決まる）
+ // dir は合格の向き：ge=以上 / le=以下 / lt=未満 / range=threshold[0]より大きく threshold[1]以下。margin は合格側への余裕（正=合格側、負=不足分）
+ const NUM=(value,threshold,unit,dir)=>{const v=+value;if(!isFinite(v))return null;const r=x=>Math.round(x*1000)/1000;
+  const margin=dir==="ge"?v-threshold:dir==="range"?Math.min(v-threshold[0],threshold[1]-v):threshold-v;
+  return {value:r(v),threshold:Array.isArray(threshold)?threshold.map(r):r(threshold),unit,dir,margin:r(margin)}};
+ const mark=(sec,key,skill,ok,label,detail,fix,num)=>{const s=S(sec);if(s.ck[key]!=null)return;s.ck[key]=ok;const it=Object.assign({key,skill,ok,label,detail,fix},num||{});s.items.push(it);say("check",sec,label,Object.assign({key,ok,detail,fix,skill},num||{}))};
  const voice=(kind,sec,key,text)=>{const s=S(sec);s.vo=s.vo||{};if(s.vo[key])return;s.vo[key]=true;out.push({type:"voice",kind,sec:sec.id,scene:sec.name,key,text})}; // kind: nav（道案内）/ hint（行動の促し）
  const NAV={left:"この先、左折です",right:"この先、右折です",stop:"この先、一時停止です",rail:"この先、踏切です",signal:"この先、信号のある交差点です",curve:"この先、カーブです",lanechange:"この先、右に進路変更します",obstacle:"前方に障害物があります",s:"この先、S字です",crank:"この先、クランクです",reverse:"この先、方向変換です",hill:"この先、坂道発進です",downhill:"この先、下り坂です",goal:"発着点に戻ります"};
  const warn=(sec,key,text)=>{const s=S(sec);if(s.warn[key])return;s.warn[key]=true;say("warn",sec,text,{key})};
@@ -1856,9 +1861,9 @@ function makeCoach(course,gset){
    switch(sec.type){
    case "start":{
     if(moving&&prev&&prev.v<=g.moveV&&s.ck.sig==null){const w=win(4);if(q.sig!=null)mark(sec,"sig","sig",w.some(x=>x.sig===1),"発進の合図","",`動き出す前に右ウインカー`);
-     mark(sec,"look","look",w.some(x=>x.yaw>=p.checkYaw),"右後方の目視確認",`${Math.round(Math.max(...w.map(x=>x.yaw)))}度`,"発進の直前に右後ろを振り向いて確認");
+     mark(sec,"look","look",w.some(x=>x.yaw>=p.checkYaw),"右後方の目視確認",`${Math.round(Math.max(...w.map(x=>x.yaw)))}度`,"発進の直前に右後ろを振り向いて確認",NUM(Math.max(...w.map(x=>x.yaw)),p.checkYaw,"度","ge"));
      if(q.pbrake!=null)mark(sec,"pb","smooth",q.pbrake!==1,"ハンドブレーキを戻す","","発進前にハンドブレーキを戻す")}
-    if(q.s>=10&&s.ck.smooth==null){const w=win(3);const mx=Math.max(...w.map(x=>x.ax||0));mark(sec,"smooth","smooth",mx<0.25,"滑らかな発進",`${mx.toFixed(2)}G`,"アクセルはゆっくり踏み込む");review(sec)}
+    if(q.s>=10&&s.ck.smooth==null){const w=win(3);const mx=Math.max(...w.map(x=>x.ax||0));mark(sec,"smooth","smooth",mx<0.25,"滑らかな発進",`${mx.toFixed(2)}G`,"アクセルはゆっくり踏み込む",NUM(mx,0.25,"G","lt"));review(sec)}
     break}
    case "left":case "right":{
     const L=sec.type==="left",dir=L?-1:1,ts=sec.turnS,d=ts-q.s;const need=p.narrowExit?0.5:Math.min(p.sigDist,Math.max(ts-prevEnd(sec)-2,3));
@@ -1867,20 +1872,20 @@ function makeCoach(course,gset){
     if(!p.narrowExit&&d<=12&&d>0){const gap=L?lw(sec)/2-VH+q.off/100:lw(sec)/2-VH-q.off/100;if(gap>(L?1.0:0.5)+0.1)warn(sec,"pos",L?"もっと左に寄せて":"もっと中央に寄せて")}
     if(d<=5&&d>-6&&q.v>p.joko+1)warn(sec,"spd","速度を落として（徐行）");
     if(d>-8&&d<=5)s.vmax=Math.max(s.vmax,q.v);
-    if(d<=3&&s.ck.sig==null){if(q.sig!=null)mark(sec,"sig","sig",s.sigAt!=null&&s.sigAt>=need-0.5,`${L?"左":"右"}折の合図`,s.sigAt!=null?`${Math.round(s.sigAt)}m手前`:"出していない",`${Math.round(need)}m手前でウインカー`);
-     if(!p.narrowExit){const gap=L?lw(sec)/2-VH+q.off/100:lw(sec)/2-VH-q.off/100;mark(sec,"pos","pos",gap<(L?1.0:0.5),L?"左端に寄せる":"中央に寄せる",`${gap.toFixed(2)}m`,L?"曲がる前に左端から1m以内まで寄せる":"曲がる前に中央から0.5m以内まで寄せる")}
-     const w=win(5);if(L)mark(sec,"look","look",w.some(x=>x.yaw<=-p.blindYaw),"巻き込み確認",`左${Math.round(-Math.min(...w.map(x=>x.yaw)))}度`,"曲がる直前に左後ろを振り向く");
+    if(d<=3&&s.ck.sig==null){if(q.sig!=null)mark(sec,"sig","sig",s.sigAt!=null&&s.sigAt>=need-0.5,`${L?"左":"右"}折の合図`,s.sigAt!=null?`${Math.round(s.sigAt)}m手前`:"出していない",`${Math.round(need)}m手前でウインカー`,NUM(s.sigAt!=null?s.sigAt:0,need-0.5,"m","ge"));
+     if(!p.narrowExit){const gap=L?lw(sec)/2-VH+q.off/100:lw(sec)/2-VH-q.off/100;mark(sec,"pos","pos",gap<(L?1.0:0.5),L?"左端に寄せる":"中央に寄せる",`${gap.toFixed(2)}m`,L?"曲がる前に左端から1m以内まで寄せる":"曲がる前に中央から0.5m以内まで寄せる",NUM(gap,L?1.0:0.5,"m","lt"))}
+     const w=win(5);if(L)mark(sec,"look","look",w.some(x=>x.yaw<=-p.blindYaw),"巻き込み確認",`左${Math.round(-Math.min(...w.map(x=>x.yaw)))}度`,"曲がる直前に左後ろを振り向く",NUM(-Math.min(...w.map(x=>x.yaw)),p.blindYaw,"度","ge"));
      else mark(sec,"look","look",win(6).some(x=>x.yaw>=p.checkYaw),"右後方の確認","","寄せる前に右後ろを確認")}
-    if(d<=-8&&s.ck.speed==null)mark(sec,"speed","speed",s.vmax<=p.joko,"曲がる速度（徐行）",`最高${s.vmax.toFixed(1)}km/h`,`曲がる前に${p.joko}km/h以下まで落とす`);
+    if(d<=-8&&s.ck.speed==null)mark(sec,"speed","speed",s.vmax<=p.joko,"曲がる速度（徐行）",`最高${s.vmax.toFixed(1)}km/h`,`曲がる前に${p.joko}km/h以下まで落とす`,NUM(s.vmax,p.joko,"km/h","le"));
     if(d<=-(6+g.sigBack)&&s.ck.sigoff==null){const nextSame=turns.some(x=>x!==sec&&x.type===sec.type&&x.turnS>ts&&x.turnS-ts<p.sigDist+10);if(!nextSame&&q.sig!=null)mark(sec,"sigoff","sig",q.sig!==dir,"合図を戻す","","曲がり終えたらウインカーを戻す");else s.ck.sigoff=true;review(sec)}
     break}
    case "stop":case "rail":case "signal":{
     const S0=sec.stopS;const d=S0-q.s;const needStop=sec.type!=="signal"||q.light===3||q.light===2;
-    if(d>-0.1&&d<15&&q.v<=0.5&&s.stopT==null&&needStop){s.stopT=q.t;s.stopD=d;const byAssist=win(3).some(x=>x.assist===1);if(byAssist)mark(sec,"stoppos","stop",false,"自分で止まる","自動ブレーキで停止","停止線の手前から早めに減速して、自分で止まる");else mark(sec,"stoppos","stop",d<=2,"停止位置",`停止線の${Math.round(d*100)}cm手前`,d>2?"もっと停止線に近づいて止まる（手前2m以内）":"")}
+    if(d>-0.1&&d<15&&q.v<=0.5&&s.stopT==null&&needStop){s.stopT=q.t;s.stopD=d;const byAssist=win(3).some(x=>x.assist===1);if(byAssist)mark(sec,"stoppos","stop",false,"自分で止まる","自動ブレーキで停止","停止線の手前から早めに減速して、自分で止まる");else mark(sec,"stoppos","stop",d<=2,"停止位置",`停止線の${Math.round(d*100)}cm手前`,d>2?"もっと停止線に近づいて止まる（手前2m以内）":"",NUM(d,2,"m","le"))}
     if(s.stopT!=null&&moving&&s.go==null){s.go=q.t;const dur=q.t-s.stopT;const w=hist.filter(x=>x.t>=s.stopT);
-     if(sec.type!=="signal")mark(sec,"full","stop",dur>=1.5,"完全に止まる",`${dur.toFixed(1)}秒`,"一度しっかり止まってから（2秒）");
-     const both=w.some(x=>x.yaw<=-p.checkYaw)&&w.some(x=>x.yaw>=p.checkYaw);mark(sec,"look","look",both,"左右の確認",`左${Math.round(-Math.min(...w.map(x=>x.yaw)))}度・右${Math.round(Math.max(...w.map(x=>x.yaw)))}度`,"止まったら左右に顔を向けてしっかり確認");
-     if(sec.type==="stop"&&q.ct!=null)mark(sec,"yield","look",!(q.ct>0&&q.ct<3.5),"交差車を待つ",q.ct>0?`交差点まで${q.ct.toFixed(1)}秒で出た`:"","交差車が通り過ぎるまで待ってから出る");
+     if(sec.type!=="signal")mark(sec,"full","stop",dur>=1.5,"完全に止まる",`${dur.toFixed(1)}秒`,"一度しっかり止まってから（2秒）",NUM(dur,1.5,"秒","ge"));
+     const both=w.some(x=>x.yaw<=-p.checkYaw)&&w.some(x=>x.yaw>=p.checkYaw);mark(sec,"look","look",both,"左右の確認",`左${Math.round(-Math.min(...w.map(x=>x.yaw)))}度・右${Math.round(Math.max(...w.map(x=>x.yaw)))}度`,"止まったら左右に顔を向けてしっかり確認",NUM(Math.min(-Math.min(...w.map(x=>x.yaw)),Math.max(...w.map(x=>x.yaw))),p.checkYaw,"度","ge"));
+     if(sec.type==="stop"&&q.ct!=null)mark(sec,"yield","look",!(q.ct>0&&q.ct<3.5),"交差車を待つ",q.ct>0?`交差点まで${q.ct.toFixed(1)}秒で出た`:"","交差車が通り過ぎるまで待ってから出る",q.ct>0?NUM(q.ct,3.5,"秒","ge"):null);
      if(sec.type==="rail"&&q.window!=null)mark(sec,"window","look",w.some(x=>x.window===1),"窓を開けて音を確認","","踏切の前では窓を開けて、音と目で確認")}
     if(d<-0.3&&s.stopT==null&&sec.type!=="signal"){mark(sec,"stoppos","stop",false,"停止線で止まる","止まらずに越えた","停止線の直前で必ず止まる");warn(sec,"stop","止まって！")}
     if(sec.type==="signal"&&d<-0.3&&s.ck.light==null)mark(sec,"light","stop",!(q.light===3),"信号を守る",["","青","黄","赤"][q.light]||"","赤・黄では停止線の手前で止まる");
@@ -1888,49 +1893,49 @@ function makeCoach(course,gset){
     if(d<-10)review(sec);break}
    case "curve":{
     const vt=vAtLat(p.R,0.25);
-    if(q.s>=sec.s0&&s.ck.entry==null)mark(sec,"entry","speed",q.v<=vt+2,"カーブの手前で減速",`進入${q.v.toFixed(1)}km/h（目安${Math.floor(vt)}km/h）`,`カーブに入る前に${Math.floor(vt)}km/h以下へ`);
+    if(q.s>=sec.s0&&s.ck.entry==null)mark(sec,"entry","speed",q.v<=vt+2,"カーブの手前で減速",`進入${q.v.toFixed(1)}km/h（目安${Math.floor(vt)}km/h）`,`カーブに入る前に${Math.floor(vt)}km/h以下へ`,NUM(q.v,vt+2,"km/h","le"));
     if(inSec&&(q.brake!=null?q.brake:true)&&q.v>5&&(q.ax||0)<(q.brake!=null?-0.03:-0.05)){warn(sec,"brk","カーブの中ではブレーキを踏まない");s.brk=true}
     if(inSec)s.ay=Math.max(s.ay||0,(q.v/3.6)**2/p.R/G);
-    if(q.s>=sec.s1&&s.ck.inb==null){mark(sec,"inb","smooth",!s.brk,"カーブ内でブレーキを踏まない","","減速はカーブの手前で終わらせる");mark(sec,"g","speed",(s.ay||0)<0.3,"曲がるときの横G",`${(s.ay||0).toFixed(2)}G`,"もう少しゆっくり曲がる");review(sec)}
+    if(q.s>=sec.s1&&s.ck.inb==null){mark(sec,"inb","smooth",!s.brk,"カーブ内でブレーキを踏まない","","減速はカーブの手前で終わらせる");mark(sec,"g","speed",(s.ay||0)<0.3,"曲がるときの横G",`${(s.ay||0).toFixed(2)}G`,"もう少しゆっくり曲がる",NUM(s.ay||0,0.3,"G","lt"));review(sec)}
     break}
    case "lanechange":case "obstacle":{
     if(q.s>=sec.s0-15&&q.s<sec.s1){if(s.base==null&&q.s>=sec.s0-15)s.base=q.off;
      if(s.base!=null&&s.moveT==null&&q.off-s.base>25){s.moveT=q.t;let k=hist.length-1;while(k>=0&&hist[k].sig!==1&&q.t-hist[k].t<1)k--;let a=k;while(a>0&&hist[a-1].sig===1)a--;const lead=k>=0&&hist[k].sig===1?q.t-hist[a].t:0;const needL=p.sigSec||3;
-      if(q.sig!=null)mark(sec,"sig","sig",lead>=needL-0.3,"合図してから移る",lead?`${lead.toFixed(1)}秒前に合図`:"合図なし",`ウインカーを出して${needL}秒待ってから移る`);
+      if(q.sig!=null)mark(sec,"sig","sig",lead>=needL-0.3,"合図してから移る",lead?`${lead.toFixed(1)}秒前に合図`:"合図なし",`ウインカーを出して${needL}秒待ってから移る`,NUM(lead||0,needL-0.3,"秒","ge"));
       const w=win(4);mark(sec,"look","look",w.some(x=>x.yaw>=p.checkYaw),"右後方の目視確認","","移る前に右後ろを振り向いて確認")}
      if(sec.type==="obstacle"&&Math.abs(q.s-sec.obsS)<1.5){const clr=q.off/100-VH-p.obsEdge;s.clr=Math.max(s.clr||-9,clr)}}
-    if(q.s>=sec.s1-0.5&&!s.done){if(sec.type==="obstacle"&&s.ck.gap==null)mark(sec,"gap","pos",(s.clr||0)>=p.clearNeed,"障害物との間隔",`${(s.clr||0).toFixed(2)}m`,`${p.clearNeed}m以上あけて避ける`);review(sec)}
+    if(q.s>=sec.s1-0.5&&!s.done){if(sec.type==="obstacle"&&s.ck.gap==null)mark(sec,"gap","pos",(s.clr||0)>=p.clearNeed,"障害物との間隔",`${(s.clr||0).toFixed(2)}m`,`${p.clearNeed}m以上あけて避ける`,NUM(s.clr||0,p.clearNeed,"m","ge"));review(sec)}
     break}
    case "s":case "crank":case "reverse":{
     if(inSec&&(sec.type!=="reverse"||q.s>sec.marks[0])){const m=p.roadW/2-Math.abs(q.off)/100-VH;s.minM=Math.min(s.minM,m);if(m<0.12&&m>-0.3)warn(sec,"edge",`${q.off>0?"右":"左"}の縁石に近い！`);if(q.v>p.safeV&&q.gear!==1)warn(sec,"spd","速度を落として")}
     if(inSec)s.vmax=Math.max(s.vmax,q.gear===1?0:q.v);
-    if(inSec&&prev&&q.gear===1&&prev.gear!==1){s.rev++;if(sec.type==="reverse"&&s.ck.look==null){const w=win(3);mark(sec,"look","look",w.some(x=>Math.abs(x.yaw)>=p.backYaw),"バック前の後方確認","","ギアをRに入れたら後ろを振り向く")}
+    if(inSec&&prev&&q.gear===1&&prev.gear!==1){s.rev++;if(sec.type==="reverse"&&s.ck.look==null){const w=win(3);mark(sec,"look","look",w.some(x=>Math.abs(x.yaw)>=p.backYaw),"バック前の後方確認","","ギアをRに入れたら後ろを振り向く",NUM(Math.max(...w.map(x=>Math.abs(x.yaw))),p.backYaw,"度","ge"))}
      else if(sec.type!=="reverse"&&s.rev>p.maxRev)warn(sec,"kiri","切り返し（次は手前で大きく回る）")}
     if(sec.type==="reverse"&&inSec&&q.gear===1){s.rmax=Math.max(s.rmax||0,Math.abs(q.yaw));s.rv=Math.max(s.rv||0,q.v)}
     if(q.s>=sec.s1-0.3&&!s.done&&q.gear!==1){
-     mark(sec,"margin","narrow",s.minM>=0.15,"縁石との余裕",`最小${Math.round(s.minM*100)}cm`,"タイヤと縁石の間を15cm以上保つ");
-     if(sec.type!=="reverse"){mark(sec,"speed","speed",s.vmax<=p.safeV,"狭路の速度",`最高${s.vmax.toFixed(1)}km/h`,`${p.safeV}km/h以下でゆっくり`);mark(sec,"kiri","narrow",s.rev<=p.maxRev,"切り返しなしで通過",s.rev?`${s.rev}回`:"なし","曲がり角の手前まで引きつけてからハンドルを切る")}
-     else{mark(sec,"around","look",(s.rmax||0)>=g.revLookYaw,"後退中も後ろを見る","","後退中は後ろを見続ける");mark(sec,"rspd","speed",(s.rv||0)<=p.safeV,"後退の速度",`${(s.rv||0).toFixed(1)}km/h`,"後退は歩く速さで")}
+     mark(sec,"margin","narrow",s.minM>=0.15,"縁石との余裕",`最小${Math.round(s.minM*100)}cm`,"タイヤと縁石の間を15cm以上保つ",NUM(s.minM,0.15,"m","ge"));
+     if(sec.type!=="reverse"){mark(sec,"speed","speed",s.vmax<=p.safeV,"狭路の速度",`最高${s.vmax.toFixed(1)}km/h`,`${p.safeV}km/h以下でゆっくり`,NUM(s.vmax,p.safeV,"km/h","le"));mark(sec,"kiri","narrow",s.rev<=p.maxRev,"切り返しなしで通過",s.rev?`${s.rev}回`:"なし","曲がり角の手前まで引きつけてからハンドルを切る",NUM(s.rev,p.maxRev,"回","le"))}
+     else{mark(sec,"around","look",(s.rmax||0)>=g.revLookYaw,"後退中も後ろを見る","","後退中は後ろを見続ける",NUM(s.rmax||0,g.revLookYaw,"度","ge"));mark(sec,"rspd","speed",(s.rv||0)<=p.safeV,"後退の速度",`${(s.rv||0).toFixed(1)}km/h`,"後退は歩く速さで",NUM(s.rv||0,p.safeV,"km/h","le"))}
      review(sec)}
     break}
    case "hill":{
     if(inSec&&q.v<=0.5&&s.stopS==null){s.stopS=q.s;s.maxS=q.s}
-    if(s.stopS!=null&&s.ck.roll==null){s.maxS=Math.max(s.maxS,q.s);const back=s.maxS-q.s;s.back=Math.max(s.back||0,back);if(back>0.2)warn(sec,"roll","下がっています！ブレーキ");if(q.s>s.stopS+1.5)mark(sec,"roll","smooth",(s.back||0)<0.3,"坂道発進で下がらない",`${Math.round((s.back||0)*100)}cm`,"ハンドブレーキを使って、アクセルを踏んでから戻す")}
+    if(s.stopS!=null&&s.ck.roll==null){s.maxS=Math.max(s.maxS,q.s);const back=s.maxS-q.s;s.back=Math.max(s.back||0,back);if(back>0.2)warn(sec,"roll","下がっています！ブレーキ");if(q.s>s.stopS+1.5)mark(sec,"roll","smooth",(s.back||0)<0.3,"坂道発進で下がらない",`${Math.round((s.back||0)*100)}cm`,"ハンドブレーキを使って、アクセルを踏んでから戻す",NUM(s.back||0,0.3,"m","lt"))}
     if(inSec&&sec.stopS!=null&&q.s>=sec.stopS)s.vmax=Math.max(s.vmax,q.v);
-    if(q.s>=sec.s1-0.3&&!s.done){mark(sec,"crest","speed",s.vmax<=p.joko,"頂上付近は徐行",`${s.vmax.toFixed(1)}km/h`,`頂上付近は${p.joko}km/h以下`);review(sec)}
+    if(q.s>=sec.s1-0.3&&!s.done){mark(sec,"crest","speed",s.vmax<=p.joko,"頂上付近は徐行",`${s.vmax.toFixed(1)}km/h`,`頂上付近は${p.joko}km/h以下`,NUM(s.vmax,p.joko,"km/h","le"));review(sec)}
     break}
-   case "downhill":{if(inSec){s.vmax=Math.max(s.vmax,q.v);if(q.v>p.joko+1)warn(sec,"spd","ブレーキで速度を抑えて")}if(q.s>=sec.s1-0.3&&!s.done){mark(sec,"speed","speed",s.vmax<=p.joko,"下り坂の速度",`${s.vmax.toFixed(1)}km/h`,`${p.joko}km/h以下で下る`);review(sec)}break}
+   case "downhill":{if(inSec){s.vmax=Math.max(s.vmax,q.v);if(q.v>p.joko+1)warn(sec,"spd","ブレーキで速度を抑えて")}if(q.s>=sec.s1-0.3&&!s.done){mark(sec,"speed","speed",s.vmax<=p.joko,"下り坂の速度",`${s.vmax.toFixed(1)}km/h`,`${p.joko}km/h以下で下る`,NUM(s.vmax,p.joko,"km/h","le"));review(sec)}break}
    case "straight":{
     if(inSec){s.offs.push([q.t,q.off]);s.vmax=Math.max(s.vmax,q.v);if(p.instruct&&q.v>p.limit)warn(sec,"over",`${p.limit}km/hを超えています`)}
     if(q.s>=sec.s1-0.3&&!s.done&&s.offs.length>10){const o=s.offs;let best=0;for(let k=0;k<o.length;k++){const w=o.filter(x=>Math.abs(x[0]-o[k][0])<=1);const m=w.reduce((a,x)=>a+x[1],0)/w.length;best=Math.max(best,Math.abs(o[k][1]-m))}
-     mark(sec,"weave","pos",best*2<g.weaveFloor,"まっすぐ走る",`振れ幅${Math.round(best*2)}cm`,"近くではなく遠くを見てハンドルを小さく");
-     if(p.instruct)mark(sec,"ins","speed",s.vmax>p.limit-5&&s.vmax<=p.limit,"指定速度で走る",`最高${s.vmax.toFixed(1)}km/h`,`${p.limit-5}〜${p.limit}km/hを保つ`);
+     mark(sec,"weave","pos",best*2<g.weaveFloor,"まっすぐ走る",`振れ幅${Math.round(best*2)}cm`,"近くではなく遠くを見てハンドルを小さく",NUM(best*2,g.weaveFloor,"cm","lt"));
+     if(p.instruct)mark(sec,"ins","speed",s.vmax>p.limit-5&&s.vmax<=p.limit,"指定速度で走る",`最高${s.vmax.toFixed(1)}km/h`,`${p.limit-5}〜${p.limit}km/hを保つ`,NUM(s.vmax,[p.limit-5,p.limit],"km/h","range"));
      review(sec)}
     break}
    case "goal":{
-    if(q.s>=sec.s0-6&&s.ck.look==null&&q.s<sec.s0+3){s.gl=s.gl||q.t}if(s.gl&&s.ck.look==null&&q.t-s.gl>2.5){mark(sec,"look","look",win(7.5).some(x=>x.yaw<=-45),"寄せる前の左後方確認","","左に寄せる前に左後ろを振り向いて確認")}
+    if(q.s>=sec.s0-6&&s.ck.look==null&&q.s<sec.s0+3){s.gl=s.gl||q.t}if(s.gl&&s.ck.look==null&&q.t-s.gl>2.5){mark(sec,"look","look",win(7.5).some(x=>x.yaw<=-45),"寄せる前の左後方確認","","左に寄せる前に左後ろを振り向いて確認",NUM(-Math.min(...win(7.5).map(x=>x.yaw)),45,"度","ge"))}
     if(q.s>=sec.s0&&q.v<=0.5&&s.fin==null&&q.s>sec.s1-1.5){s.fin=q.t;const gap=lw(sec)/2-VH+q.off/100;const dev=q.s-sec.s1;
-     mark(sec,"edge","pos",gap<p.edgeMax,"左端に寄せて止まる",`${Math.round(gap*100)}cm`,`左端から${p.edgeMax*100}cm以内に寄せる`);mark(sec,"pole","stop",Math.abs(dev)<p.poleTol,"目標に合わせて止まる",`${Math.round(dev*100)}cm`,"停止目標の横で止まる")}
+     mark(sec,"edge","pos",gap<p.edgeMax,"左端に寄せて止まる",`${Math.round(gap*100)}cm`,`左端から${p.edgeMax*100}cm以内に寄せる`,NUM(gap,p.edgeMax,"m","lt"));mark(sec,"pole","stop",Math.abs(dev)<p.poleTol,"目標に合わせて止まる",`${Math.round(dev*100)}cm`,"停止目標の横で止まる",NUM(Math.abs(dev),p.poleTol,"m","lt"))}
     if(s.fin!=null&&!s.done&&(q.door===1||q.t-s.fin>3.2)){if(q.pbrake!=null)mark(sec,"park","smooth",q.pbrake===1&&q.gear===0,"ハンドブレーキ・Pレンジ","","止まったらハンドブレーキとP");review(sec)}
     break}
    }
@@ -1952,7 +1957,8 @@ function coachSummary(msgs){ // 振り返りをまとめる：技能ごとの達
 const TEACH_VER="rule_v0.1";
 const TEACH_CFG={indepStreak:3,depStreak:3,remindAfter:2,explainAfter:3,escalateAfter:5,hist:10,
  w:{look:3,stop:3,speed:2,sig:2,pos:1.5,narrow:1,smooth:1},
- reward:{ok:3,ng:-5,indep:10,say:-1}};
+ closeRel:0.15, // 不合格でも、閾値との差がこの割合以内なら「あと少し」
+ reward:{ok:3,ng:-5,indep:10,say:-1,improve:1}};
 // 促し（hint のキー）が、どのチェック項目を助けるものか。ここにない促し（対向車・交差車・後続車の知らせ、目標速度の案内）は止めない
 const HINT_FOR={start:{go:["sig","look"]},obstacle:{go:["sig","look"]},lanechange:{go:["sig","look"]},curve:{slow:["entry"]},
  left:{sig:["sig"],pos:["pos"],spd:["speed"],look:["look"],off:["sigoff"]},right:{sig:["sig"],pos:["pos"],spd:["speed"],look:["look"],off:["sigoff"]},
@@ -1968,13 +1974,15 @@ function makeTeacher(course,learner,opt){
  const typeOf=id=>{const s=course.secs.find(x=>x.id===id);return s?s.type:null};
  const item=k=>LN.items[k]||(LN.items[k]={n:0,ok:0,fail:0,hist:[],testing:false,label:"",fix:""});
  const SS=id=>secSt[id]||(secSt[id]={helped:{},prevFail:{}});
- const snap=it=>({n:it.n,fail:it.fail,recent:it.hist.slice(-3).map(h=>(h.ok?"o":"x")+(h.helped?"+":""))});
+ const snap=it=>({n:it.n,fail:it.fail,recent:it.hist.slice(-3).map(h=>(h.ok?"o":"x")+(h.helped?"+":"")),margins:it.hist.slice(-3).map(h=>h.margin==null?null:h.margin)});
+ // 閾値に対する不足の割合（0.1＝閾値の10%足りない）。数値のない項目は null
+ const shortRel=c=>{if(c.margin==null||c.margin>=0)return c.margin==null?null:0;const th=Array.isArray(c.threshold)?c.threshold[1]:c.threshold;return th?-c.margin/Math.abs(th):null};
  const decide=(t,sec,kind,keys,rule,action,text,why)=>{const ty=typeOf(sec);
   const d={id:log.length,t:Math.round(t*10)/10,sec,scene:ty,kind,keys,rule,action,text,why,policy:TEACH_VER,
    state:Object.fromEntries(keys.map(k=>[k,snap(item(ty+":"+k))])),outcome:{},reward:null};
   log.push(d);keys.forEach(k=>(pend[ty+":"+k]=pend[ty+":"+k]||[]).push(d));return d};
  const rewardOf=d=>{const R=C.reward;let r=d.action==="say"?R.say:0;
-  Object.values(d.outcome).forEach(o=>{r+=o.ok?R.ok:R.ng;if(o.ok&&!o.helped&&d.action==="suppress")r+=R.indep});return r};
+  Object.values(d.outcome).forEach(o=>{r+=o.ok?R.ok:R.ng;if(o.ok&&!o.helped&&d.action==="suppress")r+=R.indep;if(!o.ok&&o.improved)r+=R.improve});return r};
  // 促しを言うか（true）止めるか（false）
  function gateHint(m,t){
   const ty=typeOf(m.sec);const keys=(HINT_FOR[ty]||{})[m.key];
@@ -1987,9 +1995,12 @@ function makeTeacher(course,learner,opt){
   keys.forEach(k=>SS(m.sec).helped[k]=true);decide(t,m.sec,"hint",keys,"H3","say",m.text,"");return true}
  function onCheck(m,t){
   const ty=typeOf(m.sec);if(!ty||!m.key)return;const ik=ty+":"+m.key;const it=item(ik);const ss=SS(m.sec);const helped=!!ss.helped[m.key];
-  ss.prevFail[m.key]=it.fail;it.n++;if(m.ok){it.ok++;it.fail=0}else it.fail++;it.label=m.text;it.fix=m.fix||it.fix;it.testing=false;
-  it.hist.push({ok:!!m.ok,helped,t:Math.round(t*10)/10});if(it.hist.length>C.hist)it.hist.shift();
-  (pend[ik]||[]).forEach(d=>{d.outcome[m.key]={ok:!!m.ok,helped,detail:m.detail||""};if(Object.keys(d.outcome).length===d.keys.length)d.reward=rewardOf(d)});
+  const prevH=it.hist[it.hist.length-1];const margin=m.margin==null?null:m.margin;
+  const delta=margin!=null&&prevH&&prevH.margin!=null?Math.round((margin-prevH.margin)*1000)/1000:null;
+  ss.prevFail[m.key]=it.fail;it.n++;if(m.ok){it.ok++;it.fail=0}else it.fail++;it.label=m.text;it.fix=m.fix||it.fix;it.testing=false;it.unit=m.unit||it.unit;
+  it.hist.push({ok:!!m.ok,helped,t:Math.round(t*10)/10,value:m.value==null?null:m.value,margin});if(it.hist.length>C.hist)it.hist.shift();
+  (pend[ik]||[]).forEach(d=>{d.outcome[m.key]={ok:!!m.ok,helped,detail:m.detail||"",value:m.value==null?null:m.value,threshold:m.threshold==null?null:m.threshold,unit:m.unit||"",margin,delta,improved:delta!=null&&delta>0};
+   if(Object.keys(d.outcome).length===d.keys.length)d.reward=rewardOf(d)});
   delete pend[ik]}
  // 振り返り：不合格が複数あっても、いちばん大事な1つに絞る
  function onReview(m,t){
@@ -2000,7 +2011,8 @@ function makeTeacher(course,learner,opt){
   let rule="V5",text=f.fix||f.label;const why=WHY[f.key]?`。${WHY[f.key]}`:"。";
   if(n>=C.escalateAfter){rule="V1";m.escalate=true;text=`${text}${why}教習の後で指導員と一緒に振り返りましょう`}
   else if(n>=C.explainAfter){rule="V2";text=`${text}${WHY[f.key]?why:""}`}
-  m.focus={key:f.key,label:f.label,text,rule};m.fixes=[text].concat((m.fixes||[]).filter(x=>x!==f.fix));
+  const sr=shortRel(f);if(rule==="V5"&&sr!=null&&sr<=C.closeRel){rule="V4";text=`あと少しです（${f.detail}）。${text}`}
+  m.focus={key:f.key,label:f.label,text,rule,value:f.value==null?null:f.value,margin:f.margin==null?null:f.margin};m.fixes=[text].concat((m.fixes||[]).filter(x=>x!==f.fix));
   decide(t,m.sec,"review",[f.key],rule,"say",text,n>1?`${n}回続けてできていない`:"1回目のミス")}
  // 予告：同じ場面で続けて失敗している項目があれば、事前に一言足す
  function onPre(m,t,out){
