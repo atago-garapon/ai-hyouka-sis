@@ -15,7 +15,7 @@ const E = loadEngine();
 const RUNS = +process.argv[2] || 5;
 const PROFS = ["standard", "practice", "abort"];
 const problems = [];
-const total = { runs: 0, samples: 0, danger: 0, high: 0, pass: 0, block: 0, defer: 0, release: 0, expire: 0 };
+const total = { runs: 0, samples: 0, danger: 0, high: 0, pass: 0, quiet: 0, block: 0, defer: 0, release: 0, expire: 0 };
 const byWhy = {};
 
 function check(cond, msg) {
@@ -48,13 +48,19 @@ for (const ck of Object.keys(E.COURSES)) {
             if (m.type === "check") return;
             check(st.load !== "danger", `${tag} t=${q.t.toFixed(1)}：危険の状態で「${m.text}」が出た`);
             if (st.load === "high") {
-              check(m.type !== "pre" && m.type !== "review", `${tag} t=${q.t.toFixed(1)}：高負荷で${m.type}が出た`);
+              check(m.type !== "review", `${tag} t=${q.t.toFixed(1)}：高負荷で振り返りが出た`);
+              check(m.type !== "pre" || m.quiet || m.text.length <= E.GATE_CFG.shortLen, `${tag} t=${q.t.toFixed(1)}：高負荷で長い予告がバナーつきで出た`);
               check(!(m.key === "remind"), `${tag} t=${q.t.toFixed(1)}：高負荷で前回の課題が出た`);
             }
           });
         });
         G.finish(smp[smp.length - 1].t);
         G.log.forEach((x) => (total[x.verdict] = (total[x.verdict] || 0) + 1));
+        // 発進前（止まっている）と発着点の手前の促しは、高負荷を理由に止めない
+        G.log.filter((x) => x.verdict === "block" && x.load === "high").forEach((x) => {
+          const ty = (course.secs.find((s) => s.id === x.sec) || {}).type;
+          check(ty !== "start" && ty !== "goal", `${tag} t=${x.t}：${ty === "start" ? "発進" : "発着点"}の促し「${x.text}」を高負荷で止めた（${x.why.join("+")}）`);
+        });
         // 止めた・捨てた指導が、指導AIの記録で「言っていない」になっているか
         G.log.filter((x) => (x.verdict === "block" || x.verdict === "expire") && x.did != null).forEach((x) => {
           const d = T.log[x.did];
@@ -80,7 +86,7 @@ for (const ck of Object.keys(E.COURSES)) {
 const pct = (n) => `${((n / total.samples) * 100).toFixed(1)}%`;
 console.log(`Safety Gate（${E.GATE_VER}）チェック：走行 ${total.runs}本（コース ${Object.keys(E.COURSES).length} × ${PROFS.join("・")} × 周りの車なし/あり × ${RUNS}本）`);
 console.log(`  サンプル ${total.samples}件：危険 ${pct(total.danger)}・高負荷 ${pct(total.high)}`);
-console.log(`  指導の扱い：通した ${total.pass} / 止めた ${total.block} / 後回し ${total.defer}（あとで出した ${total.release}・捨てた ${total.expire}）`);
+console.log(`  指導の扱い：通した ${total.pass} / 予告を案内欄だけに ${total.quiet} / 止めた ${total.block} / 後回し ${total.defer}（あとで出した ${total.release}・捨てた ${total.expire}）`);
 console.log(`  負荷が上がった理由（サンプル数）：` + Object.entries(byWhy).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join("、"));
 if (problems.count) {
   console.log(`\n✗ 問題 ${problems.count}件`);

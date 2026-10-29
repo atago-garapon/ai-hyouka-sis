@@ -2125,13 +2125,14 @@ function makeTeacher(course,learner,opt){
    指導AIが言うと決めた指導を、運転の状況を見て「通す・止める・後回しにする」。安全監視（makeMonitor）の警告・自動ブレーキはここを通さない。
    運転の負荷は毎サンプル3段階で判定する：
      danger 危険  ：安全監視が反応中、または反応・自動ブレーキ・緊急停止から3秒以内 → 指導はすべて止める（予告・振り返りは後回し）
-     high   高負荷：右左折の最中・停止線の直前・狭路・進路変更・カーブの中・周りの車が近い → 道案内・短い注意・短い促し・周りの車の知らせだけ通す
+     high   高負荷：（車が動いていて）右左折の最中・停止線の直前・狭路・進路変更・カーブの中、または周りの車が近い
+                   → 道案内・短い注意・短い促し・周りの車の知らせだけ通す。長い予告はバナーを出さず画面の案内欄にだけ出す
      normal 通常  ：すべて通す
    道案内・注意・促しは時機を逃すと意味がないので、通すか止めるかだけ。予告と振り返りは後回しにして、通常に戻ったら出す（20秒過ぎたら捨てる）。
    止めた・捨てた指導は opt.onGate で指導AIに返す（makeTeacher の gated）。check（評価の記録）は指導ではないので常に通す。
    Gate の中でエラーが起きたら、check 以外をすべて止める（安全側に倒す）。 */
 const GATE_VER="safety_gate_v0.1";
-const GATE_CFG={dangerHold:3,deferMax:20,shortLen:20,turnBefore:12,turnAfter:8,stopBefore:15,stopAfter:3,lcBefore:15,ctNear:4,otNear:4,rgNear:25,ttcNear:3};
+const GATE_CFG={dangerHold:3,deferMax:20,shortLen:20,goalBefore:12,turnBefore:12,turnAfter:8,stopBefore:15,stopAfter:3,lcBefore:15,ctNear:4,otNear:4,rgNear:25,ttcNear:3};
 // alarms：その時点で安全監視が出している項目（makeMonitor の戻り値）。渡さなければ Gate が自分で安全監視を回す
 function makeSafetyGate(course,gset,opt){
  const C=Object.assign({},GATE_CFG,opt||{});const g=Object.assign({},GLOBAL_DEF,gset||{});const onGate=C.onGate||(()=>{});
@@ -2142,12 +2143,15 @@ function makeSafetyGate(course,gset,opt){
   if(alarms.length||q.assist===1||q.estop===1)lastA=q.t;
   if(q.t-lastA<C.dangerHold)return ["danger",alarms.length?alarms.slice():[q.assist===1?"自動ブレーキ":q.estop===1?"緊急停止":"安全監視の反応直後"]];
   const r=[],s=q.s,mv=q.v>g.moveV;
-  course.secs.forEach(x=>{
+  // 場面による高負荷は、車が動いているときだけ（止まっている車への発進の促しなどは通す）
+  // 発着点の手前は、直前の狭路より発着点を優先する（寄せて止まる促しを通す）
+  const nearGoal=course.secs.some(x=>x.type==="goal"&&s>=x.s0-C.goalBefore);
+  if(mv)course.secs.forEach(x=>{
    if(x.turnS!=null&&s>x.turnS-C.turnBefore&&s<x.turnS+C.turnAfter)r.push("右左折");
-   if(x.stopS!=null&&["stop","rail","signal"].includes(x.type)&&mv&&s>x.stopS-C.stopBefore&&s<x.stopS+C.stopAfter)r.push("停止線");
-   if(["s","crank","reverse"].includes(x.type)&&s>=x.s0&&s<x.s1)r.push("狭路");
+   if(x.stopS!=null&&["stop","rail","signal"].includes(x.type)&&s>x.stopS-C.stopBefore&&s<x.stopS+C.stopAfter)r.push("停止線");
+   if(["s","crank","reverse"].includes(x.type)&&!nearGoal&&s>=x.s0&&s<x.s1)r.push("狭路");
    if(["lanechange","obstacle"].includes(x.type)&&s>=x.s0-C.lcBefore&&s<x.s1)r.push("進路変更");
-   if(x.type==="curve"&&mv&&s>=x.s0&&s<x.s1)r.push("カーブ")});
+   if(x.type==="curve"&&s>=x.s0&&s<x.s1)r.push("カーブ")});
   if((q.ct>0&&q.ct<C.ctNear)||(q.ot>0&&q.ot<C.otNear)||(q.rg>0&&q.rg<C.rgNear))r.push("周りの車");
   if(q.gap>0&&q.v>5&&q.gap/(q.v/3.6)<C.ttcNear)r.push("前の車");
   return r.length?["high",[...new Set(r)]]:["normal",[]]}
@@ -2156,6 +2160,7 @@ function makeSafetyGate(course,gset,opt){
  const kindOf=m=>m.type==="check"?"record":m.type==="voice"?(m.kind==="nav"?"nav":"hint"):m.type==="warn"?"warn":"later";
  function verdictOf(m,ld){const k=kindOf(m);
   if(k==="record"||ld==="normal")return "pass";
+  if(ld==="high"&&m.type==="pre")return (m.text||"").length<=C.shortLen?"pass":"quiet"; // 高負荷の予告：短ければそのまま、長ければ画面の案内欄にだけ出す（バナーは出さない）
   if(k==="later")return "defer";
   if(ld==="danger")return "block";
   if(k==="hint")return isInfo(m)||(m.text||"").length<=C.shortLen?"pass":"block";
@@ -2172,13 +2177,13 @@ function makeSafetyGate(course,gset,opt){
    const out=[];
    for(let i=0;i<wait.length;){const w=wait[i];if(q.t-w.t0>C.deferMax||stale(w.m,q)){wait.splice(i,1);note(w.m,"expire",q.t)}else i++}
    if(ld==="normal")wait.splice(0).forEach(w=>{note(w.m,"release",q.t);out.push(w.m)});
-   msgs.forEach(m=>{const v=verdictOf(m,ld);note(m,v,q.t);if(v==="pass")out.push(m);else if(v==="defer")wait.push({m,t0:q.t})});
+   msgs.forEach(m=>{const v=verdictOf(m,ld);note(m,v,q.t);if(v==="pass")out.push(m);else if(v==="quiet")out.push(Object.assign({},m,{quiet:true}));else if(v==="defer")wait.push({m,t0:q.t})});
    return out}
   catch(e){errors++;try{(msgs||[]).forEach(m=>{if(m.type!=="check")onGate(m,{verdict:"block",load:"error",why:[String(e&&e.message||e)]})})}catch(e2){}
    return (msgs||[]).filter(m=>m&&m.type==="check")}}
  function summary(){const by={};log.forEach(x=>by[x.verdict]=(by[x.verdict]||0)+1);
   const sec={danger:0,high:0};timeline.forEach((x,i)=>{const nx=timeline[i+1];if(nx&&sec[x.load]!=null)sec[x.load]+=nx.t-x.t});
-  return {policy:GATE_VER,passed:by.pass||0,blocked:by.block||0,deferred:by.defer||0,released:by.release||0,expired:by.expire||0,errors,dangerSec:r1(sec.danger),highSec:r1(sec.high)}}
+  return {policy:GATE_VER,passed:by.pass||0,quiet:by.quiet||0,blocked:by.block||0,deferred:by.defer||0,released:by.release||0,expired:by.expire||0,errors,dangerSec:r1(sec.danger),highSec:r1(sec.high)}}
  // 教習の終わり：後回しのまま残った指導は捨てる
  function finish(t){wait.splice(0).forEach(w=>note(w.m,"expire",t!=null?t:w.t0));return summary()}
  return {step,finish,summary,state:()=>({load,why:why.slice()}),log,timeline,ver:GATE_VER}}
@@ -2690,7 +2695,7 @@ async function startTablet(blob,label){
   const L=live;L.gate=E.makeSafetyGate(course,gl,{onGate:(m,info)=>{if(L.teacher)L.teacher.gated(m,info)}});L.vtOf=t=>{const m=L.vmap;if(!m.length)return 0;let lo=0,hi=m.length-1;if(t<=m[0][0])return m[0][1];if(t>=m[hi][0])return m[hi][1];while(hi-lo>1){const mid=(lo+hi)>>1;if(m[mid][0]<=t)lo=mid;else hi=mid}return m[lo][1]};
   L.onCoach=(ms,q)=>{ms.forEach(m=>{const tm=mmss(q.t-L.t0);
     if(m.type==="voice"){voSay(m.text,m.kind);return}
-    if(m.type==="pre"){TB.guide[m.sec]=m.text;if(m.sec===TB.cur)$("#tbGuide").textContent=m.text;tbBanner("pre",m.text,4200)}
+    if(m.type==="pre"){TB.guide[m.sec]=m.text;if(m.sec===TB.cur)$("#tbGuide").textContent=m.text;if(!m.quiet)tbBanner("pre",m.text,4200)}
     else if(m.type==="warn"){tbBanner("warn","⚠ "+m.text,2800);tbMarker("#ffb300",m.text);tbCard("ded",tm,"注意："+m.text,[esc(m.scene)])}
     else if(m.type==="check"){if(m.sec===TB.cur||!TB.cur)tbCheck(m);else tbCheck(m);if(!m.ok)tbMarker("#ff7043",m.text)}
     else if(m.type==="review"){tbCard(m.good?"good":"bad",tm,m.text,m.items.map(i=>`${i.ok?"✓":"✗"} ${esc(i.label)}${i.detail?`（${esc(i.detail)}）`:""}${!i.ok&&i.fix?`<br><span style="color:#ffcc80">→ ${esc(i.fix)}</span>`:""}`));if(m.good)tbMarker("#4caf50",m.text);if(!m.good)tbBanner("bad","振り返り："+m.text+"　"+(m.fixes[0]?"→ "+m.fixes[0]:""),3800);else tbBanner("good","✓ "+(m.praise||m.text),2200);
@@ -2721,7 +2726,7 @@ function tbEnd(){
    <h3 style="margin:12px 0 2px;font-size:14px">指導の達成（技能別）</h3><div class="tb-bars">${bars}</div>
    ${sm.top.length?`<h3 style="margin:12px 0 4px;font-size:14px">次の練習で意識すること</h3><ol style="margin:0 0 0 18px;padding:0">${sm.top.map(x=>`<li style="margin:3px 0">${esc(x)}</li>`).join("")}</ol>`:`<p>全部できました。この調子で反復しましょう。</p>`}
    ${tsm?`<h3 style="margin:12px 0 2px;font-size:14px">指導AI（${esc(tsm.policy)}）</h3><p style="margin:2px 0">判断 ${tsm.decisions}件：言った ${tsm.said}・あえて言わなかった ${tsm.suppressed}　／　Reward合計 ${tsm.rewardSum}（${tsm.rewarded}件）　／　この生徒の教習 ${T.learner.sessions}回目</p>
-   ${gsm?`<p style="margin:2px 0">Safety Gate（${esc(gsm.policy)}）：止めた ${gsm.blocked}・後回し ${gsm.deferred}（あとで出した ${gsm.released}・捨てた ${gsm.expired}）　／　危険 ${gsm.dangerSec}秒・高負荷 ${gsm.highSec}秒</p>`:""}
+   ${gsm?`<p style="margin:2px 0">Safety Gate（${esc(gsm.policy)}）：止めた ${gsm.blocked}・予告を案内欄だけに ${gsm.quiet}・後回し ${gsm.deferred}（あとで出した ${gsm.released}・捨てた ${gsm.expired}）　／　危険 ${gsm.dangerSec}秒・高負荷 ${gsm.highSec}秒</p>`:""}
    <div class="btnrow"><button class="btn" type="button" id="tbTeachLog">指導ログをコピー</button><button class="btn" type="button" id="tbTeachReset">生徒の記録をリセット</button></div>`:""}
    <div class="btnrow" style="margin-top:14px"><button class="btn primary" type="button" id="tbReview">運転を振り返る</button><button class="btn" type="button" id="tbAgain">もう一度再生</button><button class="btn" type="button" id="tbToRes">詳しい採点結果</button><button class="btn" type="button" id="tbClose2">閉じる</button></div></div>`;
   $("#tbAgain").onclick=()=>{$("#tbRev").hidden=true;startTablet(TB.blob,TB.label)};$("#tbReview").onclick=openReview;TB.vmap=live.vmap.slice();TB.smp=live.smp.slice();$("#tbToRes").onclick=()=>{closeTablet();switchTab("result")};$("#tbClose2").onclick=closeTablet;
