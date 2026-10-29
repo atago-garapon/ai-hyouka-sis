@@ -2017,6 +2017,28 @@ function makeBandit(pop,opt,rand){
    belief:Object.fromEntries(arms.map((a,j)=>[a,{mean:Math.round(b[j].mean*100)/100,n:b[j].nPop,nStudent:b[j].nStu}]))}}
  function update(ctx,arm,r,LN){const p=cell(P.stats,ctx,arm);p.n++;p.s+=r;if(C.personal&&LN){const st=cell((LN.bandit=LN.bandit||{}),ctx,arm);st.n++;st.s+=r}}
  return {choose,update,pop:P,ver:BANDIT_VER}}
+/* ===== 言葉にする層（LLM Adapter）=====
+   指導AIは「何を伝えるか」（intent）だけを決め、ここで文にする。判断（Teaching Policy）と言葉（LLM）を分けるため。
+   intent：{act, scene, key, label, fix, detail, why, fails, value, threshold, unit, margin, close}
+     act：fix 直し方 / explain 理由まで説明 / escalate 指導員に引き継ぐ / praise 前回より改善 / remind 前回の課題を予告で伝える / remind_note 予告の文に添える一言
+     close：閾値まであと少し（fix で「あと少しです」を付ける）
+   いまはテンプレート（無料・同じ intent なら同じ文）。LLM に替えるときは render(intent) を持つ provider を makeVoice に渡す。
+   provider が失敗したり空の文を返したりしたら、テンプレートの文に戻す。
+   安全の発話（安全監視の警告・自動ブレーキ）と、運転中の短い促し・道案内・注意はここを通さない（固定の文のまま）。 */
+const VOICE_VER="template_v0.1";
+const TEMPLATES={
+ fix:x=>x.close?`あと少しです（${x.detail}）。${x.fix||x.label}`:(x.fix||x.label),
+ explain:x=>x.why?`${x.fix||x.label}。${x.why}`:(x.fix||x.label),
+ escalate:x=>`${x.fix||x.label}。${x.why||""}教習の後で指導員と一緒に振り返りましょう`,
+ praise:x=>`前回できなかった「${x.label}」、今回はできました`,
+ remind:x=>`前回は「${x.label}」ができていませんでした。${x.fix}`,
+ remind_note:x=>`　／前回の課題：${x.fix}`};
+const templateProvider={name:VOICE_VER,render:x=>TEMPLATES[x.act](x)};
+function makeVoice(provider){const P=provider||templateProvider;
+ function render(intent){
+  if(P!==templateProvider){try{const t=P.render(intent);if(typeof t==="string"&&t.trim())return {text:t,provider:P.name,fallback:false}}catch(e){}}
+  return {text:templateProvider.render(intent),provider:VOICE_VER,fallback:P!==templateProvider}}
+ return {render,provider:P.name}}
 function newLearner(name){return {v:1,name:name||"生徒",sessions:0,items:{},pendB:{}}}
 // opt.bandit を渡すと、促しと振り返りの判断を Contextual Bandit が行う（安全側の決まりはルールのまま）
 function makeTeacher(course,learner,opt){
@@ -2028,6 +2050,12 @@ function makeTeacher(course,learner,opt){
  // helped は「その項目を助けた指導の数」。Safety Gate が止めた指導は数から引く
  const help=(sec,k)=>{const h=SS(sec).helped;h[k]=(h[k]||0)+1};const unhelp=(sec,k)=>{const h=SS(sec).helped;h[k]=Math.max(0,(h[k]||0)-1)};
  const wOf=new Map(); // 判断の id → Bandit の結果待ち
+ // 言葉にする層。opt.voice に makeVoice(provider) を渡すと差し替えられる
+ const V=C.voice||makeVoice();
+ // 伝える内容（intent）。計測値も渡しておくと、LLM に替えたときに具体的に言える
+ const intentOf=(act,ty,it,x)=>Object.assign({act,scene:ty,key:it.key,label:it.label,fix:it.fix||"",detail:it.detail||"",why:WHY[it.key]||null,
+  value:it.value==null?null:it.value,threshold:it.threshold==null?null:it.threshold,unit:it.unit||"",margin:it.margin==null?null:it.margin},x||{});
+ const speak=intent=>{const r=V.render(intent);return {text:r.text,extra:{intent,voice:r.provider+(r.fallback?"（テンプレートに戻した）":"")}}};
  // 閾値に対する不足の割合（0.1＝閾値の10%足りない）。数値のない項目は null
  const shortRel=c=>{if(c.margin==null||c.margin>=0)return c.margin==null?null:0;const th=Array.isArray(c.threshold)?c.threshold[1]:c.threshold;return th?-c.margin/Math.abs(th):null};
  const snap=it=>{const s=stateOf(it);return {n:it.n,fail:it.fail,level:s.level,trend:s.trend,dep:s.dep,stateKey:s.key,
@@ -2073,30 +2101,28 @@ function makeTeacher(course,learner,opt){
  function onReview(m,t){
   const ty=typeOf(m.sec);const ss=SS(m.sec);const ng=m.items.filter(i=>!i.ok&&i.key);
   if(!ng.length){const rec=m.items.find(i=>i.key&&(ss.prevFail[i.key]||0)>=1);
-   if(rec){m.praise=`前回できなかった「${rec.label}」、今回はできました`;decide(t,m.sec,"review",[rec.key],"V6","say",m.praise,"前回の不合格から改善")}return}
+   if(rec){const s=speak(intentOf("praise",ty,rec));m.praise=s.text;decide(t,m.sec,"review",[rec.key],"V6","say",m.praise,"前回の不合格から改善",s.extra)}return}
   const pr=i=>(C.w[i.skill]||1)*(1+item(ty+":"+i.key).fail);const f=ng.slice().sort((a,b)=>pr(b)-pr(a))[0];const n=item(ty+":"+f.key).fail;
-  const why=WHY[f.key]?`。${WHY[f.key]}`:"。";const sr=shortRel(f);const close=sr!=null&&sr<=C.closeRel;
-  const fixText=close?`あと少しです（${f.detail}）。${f.fix||f.label}`:(f.fix||f.label);
+  const sr=shortRel(f);const close=sr!=null&&sr<=C.closeRel;
+  const I=(act,x)=>speak(intentOf(act,ty,f,Object.assign({fails:n},x||{})));
   const setFocus=(rule,text)=>{m.focus={key:f.key,label:f.label,text,rule,value:f.value==null?null:f.value,margin:f.margin==null?null:f.margin};m.fixes=[text].concat((m.fixes||[]).filter(x=>x!==f.fix))};
   const whyN=n>1?`${n}回続けてできていない`:"1回目のミス";
   // 5回続けて失敗したら、Bandit に任せず指導員に引き継ぐ
-  if(n>=C.escalateAfter){const text=`${f.fix||f.label}${why}教習の後で指導員と一緒に振り返りましょう`;m.escalate=true;setFocus("V1",text);decide(t,m.sec,"review",[f.key],"V1","say",text,whyN);return}
+  if(n>=C.escalateAfter){const s=I("escalate");m.escalate=true;setFocus("V1",s.text);decide(t,m.sec,"review",[f.key],"V1","say",s.text,whyN,s.extra);return}
   if(B){
    const st=stateOf(item(ty+":"+f.key));const ctx="review|"+st.key;const arms=WHY[f.key]?["fix","explain","none"]:["fix","none"];const ch=B.choose(ctx,arms,LN);
    const extra={ctx,arm:ch.arm,prob:ch.prob,probs:ch.probs,belief:ch.belief};
    if(ch.arm==="none"){m.fixes=[];decide(t,m.sec,"review",[f.key],"B","suppress","",`文脈 ${st.key}：何も言わない`,extra);waitB(ty,[f.key],ctx,ch.arm,false);return}
-   const text=ch.arm==="explain"?`${f.fix||f.label}${why}`:fixText;setFocus("B",text);
-   const d=decide(t,m.sec,"review",[f.key],"B","say",text,`文脈 ${st.key}：${ch.arm==="explain"?"理由まで説明":"直し方を伝える"}`,extra);wOf.set(d.id,waitB(ty,[f.key],ctx,ch.arm,true));return}
-  let rule="V5",text=f.fix||f.label;
-  if(n>=C.explainAfter){rule="V2";text=`${text}${WHY[f.key]?why:""}`}
-  else if(close){rule="V4";text=fixText}
-  setFocus(rule,text);decide(t,m.sec,"review",[f.key],rule,"say",text,whyN)}
+   const s=ch.arm==="explain"?I("explain"):I("fix",{close});setFocus("B",s.text);
+   const d=decide(t,m.sec,"review",[f.key],"B","say",s.text,`文脈 ${st.key}：${ch.arm==="explain"?"理由まで説明":"直し方を伝える"}`,Object.assign(extra,s.extra));wOf.set(d.id,waitB(ty,[f.key],ctx,ch.arm,true));return}
+  const rule=n>=C.explainAfter?"V2":close?"V4":"V5";const s=rule==="V2"?I("explain"):I("fix",{close:rule==="V4"});
+  setFocus(rule,s.text);decide(t,m.sec,"review",[f.key],rule,"say",s.text,whyN,s.extra)}
  // 予告：同じ場面で続けて失敗している項目があれば、事前に一言足す
  function onPre(m,t,out){
   const ty=typeOf(m.sec);const ks=Object.keys(LN.items).filter(k=>k.split(":")[0]===ty&&LN.items[k].fail>=C.remindAfter);if(!ks.length)return;
   const k=ks.sort((a,b)=>LN.items[b].fail-LN.items[a].fail)[0];const key=k.split(":")[1];const it=LN.items[k];
-  const text=`前回は「${it.label}」ができていませんでした。${it.fix}`;m.text+=`　／前回の課題：${it.fix}`;help(m.sec,key);
-  const d=decide(t,m.sec,"remind",[key],"R3","say",text,`${it.fail}回続けてできていない`);out.push({type:"voice",kind:"hint",sec:m.sec,scene:m.scene,key:"remind",text,did:d.id})}
+  const s=speak(intentOf("remind",ty,it,{key,fails:it.fail}));m.text+=V.render(intentOf("remind_note",ty,it,{key})).text;help(m.sec,key);
+  const d=decide(t,m.sec,"remind",[key],"R3","say",s.text,`${it.fail}回続けてできていない`,s.extra);out.push({type:"voice",kind:"hint",sec:m.sec,scene:m.scene,key:"remind",text:s.text,did:d.id})}
  function step(msgs,q){const out=[];
   msgs.forEach(m=>{const n0=log.length;const tag=()=>{if(log.length>n0)m.did=log.length-1}; // did：このメッセージについての判断（Safety Gate の結果を返す先）
    if(m.type==="voice"&&m.kind==="hint"){const ok=gateHint(m,q.t);tag();if(ok)out.push(m);return}
@@ -2117,7 +2143,7 @@ function makeTeacher(course,learner,opt){
   if(d.reward!=null)d.reward=rewardOf(false,Object.values(d.outcome));
   const w=wOf.get(d.id);if(w)d.keys.forEach(k=>{const l=LN.pendB[ty+":"+k];const i=l?l.indexOf(w):-1;if(i>=0)l.splice(i,1)})}
  function summary(){const by={};log.forEach(d=>by[d.rule]=(by[d.rule]||0)+1);const rw=log.filter(d=>d.reward!=null);
-  return {policy:VER,decisions:log.length,said:log.filter(d=>d.action==="say").length,suppressed:log.filter(d=>d.action==="suppress").length,
+  return {policy:VER,voice:V.provider,decisions:log.length,said:log.filter(d=>d.action==="say").length,suppressed:log.filter(d=>d.action==="suppress").length,
    byRule:by,rewardSum:rw.reduce((a,d)=>a+d.reward,0),rewarded:rw.length}}
  function finish(){LN.sessions++;Object.values(LN.items).forEach(it=>it.testing=false);return summary()}
  return {step,gated,finish,summary,log,learner:LN,bandit:B}}
@@ -2187,7 +2213,7 @@ function makeSafetyGate(course,gset,opt){
  // 教習の終わり：後回しのまま残った指導は捨てる
  function finish(t){wait.splice(0).forEach(w=>note(w.m,"expire",t!=null?t:w.t0));return summary()}
  return {step,finish,summary,state:()=>({load,why:why.slice()}),log,timeline,ver:GATE_VER}}
-return {makeTeacher,newLearner,TEACH_VER,makeSafetyGate,GATE_VER,GATE_CFG,makeBandit,newBanditPop,BANDIT_VER,levelOf,stateOf,HINT_FOR,AIK,AIK_CATS,AIKMAP,aikOf,aikScore,MISTAKE_UNOBS,SENSOR_CH,SENSOR_SRC,mistakeMax,OBS,OMAP,atomicOf,buildSegments,segAtS,segEnabled,segDefaults,REPORT22,makeCoach,coachSummary,SKILL,B_GROUPS,CAT6,cat6Of,evNames,makeMonitor,makeEdge,confS,MISTAKE_GROUPS,MISTAKE_DEF,SCALE,TD,TYPENAME,PARAMDEF,GLOBAL_DEF,GLOBAL_META,COURSES,GROUPS,ITEMS,IMAP,DANGER,PROFILES,MISTAKES,CH,STRIP,FIELDS,
+return {makeTeacher,newLearner,TEACH_VER,makeVoice,VOICE_VER,TEMPLATES,makeSafetyGate,GATE_VER,GATE_CFG,makeBandit,newBanditPop,BANDIT_VER,levelOf,stateOf,HINT_FOR,AIK,AIK_CATS,AIKMAP,aikOf,aikScore,MISTAKE_UNOBS,SENSOR_CH,SENSOR_SRC,mistakeMax,OBS,OMAP,atomicOf,buildSegments,segAtS,segEnabled,segDefaults,REPORT22,makeCoach,coachSummary,SKILL,B_GROUPS,CAT6,cat6Of,evNames,makeMonitor,makeEdge,confS,MISTAKE_GROUPS,MISTAKE_DEF,SCALE,TD,TYPENAME,PARAMDEF,GLOBAL_DEF,GLOBAL_META,COURSES,GROUPS,ITEMS,IMAP,DANGER,PROFILES,MISTAKES,CH,STRIP,FIELDS,
  buildCourse,pointAt,secAt,analyze,score,simulate,toCSV,parseCSV,encodeBits,decodeBits,criteriaText,applicableSecs,itemStatus,vAtLat};
 })();
 if(typeof module!=="undefined")module.exports=ENG;
